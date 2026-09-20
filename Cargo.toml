@@ -1,0 +1,23 @@
+[package]
+name = "intpack"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Integer sequence codecs for inverted indexes: bitpacking, PFor, VByte, StreamVByte, Elias-Fano and partitioned Elias-Fano, each with skip cursors where the format allows."
+repository = "https://github.com/dbalmain/intpack"
+
+[dependencies]
+
+[dev-dependencies]
+rand = "0.9"
+
+[profile.release]
+debug = 1
+codegen-units = 1
+lto = "thin"
+
+[lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"
+todo = "warn"
+unimplemented = "warn"
