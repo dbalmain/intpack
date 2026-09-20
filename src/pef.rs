@@ -37,6 +37,7 @@ pub fn encode(universe: u32, list: &[u32], out: &mut Vec<u8>) {
     if list.is_empty() {
         return;
     }
+    let list_start = out.len();
     let partition_count = list.len().div_ceil(PARTITION_SIZE);
     let upper_l = elias_fano::low_width(universe, partition_count);
     let upper_bounds: Vec<u32> = list
@@ -100,7 +101,8 @@ pub fn encode(universe: u32, list: &[u32], out: &mut Vec<u8>) {
     let upper_lows_bytes = (partition_count * upper_l as usize).div_ceil(8);
     let upper_highs_bytes =
         (partition_count + (u64::from(universe) >> upper_l) as usize).div_ceil(8);
-    let upper_highs = &out[2 + upper_lows_bytes..2 + upper_lows_bytes + upper_highs_bytes];
+    let upper_highs = &out
+        [list_start + 2 + upper_lows_bytes..list_start + 2 + upper_lows_bytes + upper_highs_bytes];
     out.extend_from_slice(&elias_fano::encode_select0_bytes(
         universe,
         upper_l,
