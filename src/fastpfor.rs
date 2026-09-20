@@ -245,9 +245,10 @@ fn encode_page(page: &[u32], out: &mut Vec<u8>) {
 
     write_u32(out, meta.len() as u32);
     out.extend_from_slice(&meta);
-    while !out.len().is_multiple_of(4) {
-        out.push(0);
-    }
+    // Pad the metadata itself to a multiple of 4, not `out.len()`: a list
+    // may be appended after an unaligned vbyte tail.
+    let pad = meta.len().next_multiple_of(4) - meta.len();
+    out.extend(std::iter::repeat_n(0, pad));
 
     let mut bitmap = 0u32;
     for (k, slot) in except.iter().enumerate().skip(2) {
@@ -416,6 +417,47 @@ mod tests {
     }
 
     #[test]
+    fn pack32_writes_exactly_width_words() {
+        for width in 0..=32u32 {
+            let src = [0x1234_5678u32; 32];
+            let mut buf = Vec::new();
+            pack32(width, &src, &mut buf);
+            assert_eq!(buf.len(), 4 * width as usize, "width={width}");
+        }
+    }
+
+    #[test]
+    fn pack_n_roundtrip_counts() {
+        for width in 1..=32u32 {
+            for count in 1..=40 {
+                let mask = if width >= 32 {
+                    u32::MAX
+                } else {
+                    (1u32 << width) - 1
+                };
+                let src: Vec<u32> = (0..count)
+                    .map(|i| (i as u32).wrapping_mul(7) & mask)
+                    .collect();
+                let mut buf = Vec::new();
+                pack_n(width, &src, &mut buf);
+                let mut pos = 0;
+                let got = unpack_n(width, count, &buf, &mut pos);
+                assert_eq!(pos, buf.len(), "width={width} count={count} leftover");
+                assert_eq!(got, src, "width={width} count={count}");
+            }
+        }
+    }
+
+    #[test]
+    fn full_page_random() {
+        let mut rng = rand::rng();
+        let list: Vec<u32> = (0..PAGE).map(|_| rng.random_range(0..64)).collect();
+        roundtrip_unsorted(&list);
+        let list: Vec<u32> = (0..PAGE).map(|_| rng.random::<u32>()).collect();
+        roundtrip_unsorted(&list);
+    }
+
+    #[test]
     fn pack_unpack_widths() {
         for width in 0..=32 {
             let mut src = [0u32; 128];
@@ -488,9 +530,34 @@ mod tests {
     }
 
     #[test]
+    fn encode_appended_after_unaligned_tail() {
+        // One leftover vbyte byte makes the next list start unaligned.
+        let a: Vec<u32> = (0..129).collect();
+        let b: Vec<u32> = (0..1000).map(|i| i * 10).collect();
+        let mut out = Vec::new();
+        encode_sorted(&a, &mut out);
+        assert!(!out.len().is_multiple_of(4), "precondition: unaligned join");
+        let mid = out.len();
+        encode_sorted(&b, &mut out);
+        let mut got = Vec::new();
+        decode_sorted(b.len(), &out[mid..], &mut got);
+        assert_eq!(got, b);
+    }
+
+    #[test]
     fn two_pages() {
         // 65536 + 128 forces a second page.
         let list: Vec<u32> = (0..(PAGE as u32 + 128)).map(|i| i % 17).collect();
         roundtrip_unsorted(&list);
+    }
+
+    #[test]
+    fn long_second_page_small_values() {
+        // Matches uniform-d0.1 shape: ~100k ints, two pages, small gaps.
+        let n = 100_736u32;
+        let list: Vec<u32> = (0..n).map(|i| i % 32).collect();
+        roundtrip_unsorted(&list);
+        let sorted: Vec<u32> = (0..n).map(|i| i * 10).collect();
+        roundtrip_sorted(&sorted);
     }
 }
