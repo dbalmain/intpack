@@ -313,11 +313,13 @@ fn decode_sorted_scalar(n: usize, buf: &[u8], out: &mut Vec<u32>) {
 // pointers. Wrappers detect the feature and pass a valid encoding.
 #[allow(unsafe_op_in_unsafe_fn)]
 mod kernel {
-    use super::{DATA_LEN, DECODE_SHUFFLE, ENCODE_SHUFFLE, tag_of, write_group_at};
+    use super::{DATA_LEN, DECODE_SHUFFLE, ENCODE_SHUFFLE, write_group_at};
 
     use std::arch::x86_64::{
-        __m128i, _mm_add_epi32, _mm_alignr_epi8, _mm_bslli_si128, _mm_loadu_si128, _mm_set1_epi32,
-        _mm_setr_epi32, _mm_shuffle_epi8, _mm_storeu_si128, _mm_sub_epi32,
+        __m128i, _mm_add_epi32, _mm_adds_epu16, _mm_alignr_epi8, _mm_bslli_si128, _mm_loadu_si128,
+        _mm_min_epi16, _mm_min_epu8, _mm_movemask_epi8, _mm_packus_epi16, _mm_set1_epi8,
+        _mm_set1_epi16, _mm_set1_epi32, _mm_setr_epi32, _mm_shuffle_epi8, _mm_shuffle_epi32,
+        _mm_storeu_si128, _mm_sub_epi32,
     };
 
     /// Load 16 data bytes, zero-padding if fewer than 16 remain.
@@ -362,12 +364,17 @@ mod kernel {
         )
     }
 
+    /// Control byte for four values. Lemire's SSE2 length-tag sequence.
     #[inline]
     #[target_feature(enable = "ssse3")]
-    unsafe fn tag4(v: __m128i) -> u8 {
-        let mut tmp = [0u32; 4];
-        _mm_storeu_si128(tmp.as_mut_ptr().cast(), v);
-        tag_of(tmp[0]) | (tag_of(tmp[1]) << 2) | (tag_of(tmp[2]) << 4) | (tag_of(tmp[3]) << 6)
+    fn tag4(v: __m128i) -> u8 {
+        let mask_01 = _mm_set1_epi8(0x1);
+        let mask_7f00 = _mm_set1_epi16(0x7f00);
+        let a = _mm_min_epu8(mask_01, v);
+        let b = _mm_packus_epi16(a, a);
+        let c = _mm_min_epi16(b, mask_01);
+        let d = _mm_adds_epu16(c, mask_7f00);
+        _mm_movemask_epi8(d) as u8
     }
 
     /// Encode `list` into pre-sized `tags` and `data` (`data` has 16 extra bytes).
@@ -514,21 +521,20 @@ mod kernel {
 
         // First group: prefix + [0,1,2,3].
         let (deltas, len) = shuffle_at(tags, data, 0, 0, data_len);
-        let vals = _mm_add_epi32(prefix4(deltas), first_add);
-        _mm_storeu_si128(out.cast(), vals);
+        let mut prev = _mm_add_epi32(prefix4(deltas), first_add);
+        _mm_storeu_si128(out.cast(), prev);
         dp += len;
         let mut g = 1usize;
-        let mut prev = *out.add(3);
         while g < n_full && dp + 16 <= data_len {
             let tag = *tags.add(g);
             let shuf = _mm_loadu_si128(DECODE_SHUFFLE[tag as usize].as_ptr().cast());
             let deltas = _mm_shuffle_epi8(_mm_loadu_si128(data.add(dp).cast()), shuf);
             let vals = _mm_add_epi32(
                 prefix4(deltas),
-                _mm_add_epi32(_mm_set1_epi32(prev as i32), ones),
+                _mm_add_epi32(_mm_shuffle_epi32(prev, 0xff), ones),
             );
             _mm_storeu_si128(out.add(g * 4).cast(), vals);
-            prev = *out.add(g * 4 + 3);
+            prev = vals;
             dp += DATA_LEN[tag as usize] as usize;
             g += 1;
         }
@@ -536,10 +542,10 @@ mod kernel {
             let (deltas, len) = shuffle_at(tags, data, g, dp, data_len - dp);
             let vals = _mm_add_epi32(
                 prefix4(deltas),
-                _mm_add_epi32(_mm_set1_epi32(prev as i32), ones),
+                _mm_add_epi32(_mm_shuffle_epi32(prev, 0xff), ones),
             );
             _mm_storeu_si128(out.add(g * 4).cast(), vals);
-            prev = *out.add(g * 4 + 3);
+            prev = vals;
             dp += len;
             g += 1;
         }
@@ -547,7 +553,7 @@ mod kernel {
             let (deltas, _) = shuffle_at(tags, data, g, dp, data_len.saturating_sub(dp));
             let vals = _mm_add_epi32(
                 prefix4(deltas),
-                _mm_add_epi32(_mm_set1_epi32(prev as i32), ones),
+                _mm_add_epi32(_mm_shuffle_epi32(prev, 0xff), ones),
             );
             let mut tmp = [0u32; 4];
             _mm_storeu_si128(tmp.as_mut_ptr().cast(), vals);
