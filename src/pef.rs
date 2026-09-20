@@ -269,6 +269,7 @@ struct Layout<'a> {
     offset_width: u32,
     payload_start: usize,
     samples_start: usize,
+    universe: u32,
 }
 
 impl<'a> Layout<'a> {
@@ -286,6 +287,7 @@ impl<'a> Layout<'a> {
                 offset_width: 0,
                 payload_start: 0,
                 samples_start: 0,
+                universe: 0,
             };
         }
         let upper_l = u32::from(buf[0]);
@@ -311,6 +313,7 @@ impl<'a> Layout<'a> {
             offset_width,
             payload_start,
             samples_start,
+            universe,
         }
     }
 
@@ -319,6 +322,7 @@ impl<'a> Layout<'a> {
         EfLayout::from_parts_at(
             self.upper_l,
             self.partition_count,
+            self.universe,
             self.buf,
             self.upper_lows_bit,
             self.samples_start,
@@ -347,7 +351,14 @@ impl<'a> Layout<'a> {
         } else {
             let previous = ef.select_one(partition_index - 1);
             let previous_bound = ef.value_at(partition_index - 1, previous);
-            let position = ef.next_one_after(previous);
+            let Some(position) = ef.next_one_after(previous) else {
+                return Partition {
+                    start: previous_bound + 1,
+                    len: 0,
+                    universe: 0,
+                    data: PartitionData::AllOnes,
+                };
+            };
             (previous_bound + 1, ef.value_at(partition_index, position))
         };
         let universe = (u64::from(hi) + 1 - u64::from(start)) as usize;
@@ -365,7 +376,7 @@ impl<'a> Layout<'a> {
             TYPE_BITMAP => PartitionData::Bitmap(&payload[..universe.div_ceil(8)]),
             TYPE_ELIAS_FANO => {
                 let ef_l = elias_fano::low_width(universe as u32, len);
-                let ef = EfLayout::from_parts(ef_l, len, payload);
+                let ef = EfLayout::from_parts(ef_l, len, universe as u32, payload);
                 PartitionData::EliasFano { ef, payload }
             }
             _ => unreachable!(),
@@ -454,7 +465,7 @@ impl Partition<'_> {
                 })
             }
             PartitionData::EliasFano { ef, .. } => {
-                let pos = ef.next_one_after(ef.select_one(current.index));
+                let pos = ef.next_one_after(ef.select_one(current.index))?;
                 Some(Position {
                     index,
                     local: ef.value_at(index, pos),

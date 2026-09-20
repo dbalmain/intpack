@@ -5,28 +5,46 @@
 //! high part `value >> l`. The low parts are stored contiguously; the high
 //! parts are unary in a bitvector with one bit per element at position
 //! `(value >> l) + index`, so the high part of element `i` equals the number
-//! of zeros before its one. After the bitvector, the position of every
-//! [`SELECT_Q`]th one is stored as a `u32` — a select index costing 4 bytes
-//! per 256 elements (~0.02 bits/int), which is what a seek needs to skip a
-//! whole sparse region without walking it.
+//! of zeros before its one.
+//!
+//! Two sample structures follow the bitvector. The **select-one samples** are
+//! the positions of every [`SELECT_Q`]th one (a `u32` each) and answer
+//! `get(i)` by rank. The **select-zero samples** are the positions of every
+//! [`SELECT0_SUPER`]th zero (a `u32` each) plus, for every [`SELECT0_SUB`]th
+//! zero, its offset within the superblock (a `u16`); a seek reads them
+//! directly by zero-rank to land on the 64-bit word containing the first
+//! element with the target's high part, so `next_geq` is O(1)-ish instead of
+//! a binary search over the whole bitvector.
 //!
 //! Byte layout, all sections byte-aligned:
 //!
 //! ```text
-//! [l: u8][lows: n*l bits][highs: n + (universe >> l) bits][select samples: ceil(n / SELECT_Q) * u32]
+//! [l: u8][lows: n*l bits][highs: n + (universe >> l) bits]
+//! [select1: ceil(n / SELECT_Q) * u32][select0 super: ceil(z / SELECT0_SUPER) * u32]
+//! [select0 sub: ceil(z / SELECT0_SUB) * u16]   z = universe >> l
 //! ```
 //!
 //! `n` and `universe` are stored out of band by the caller. Empty lists
 //! encode to a single `l = 0` byte and decode to nothing.
 //!
 //! [`SELECT_Q`]: self::SELECT_Q
+//! [`SELECT0_SUPER`]: self::SELECT0_SUPER
+//! [`SELECT0_SUB`]: self::SELECT0_SUB
 
 use crate::bits::{Reader, Writer};
 
-/// Elements between select samples. A sample costs 4 bytes and the post-seek
-/// scan is bounded by [`SELECT_Q`] ones, so 256 keeps the index at
-/// ~0.02 bits/int while a seek lands within a few words.
+/// Elements between select-one samples. A sample costs 4 bytes and bounds
+/// the post-sample scan at [`SELECT_Q`] ones, so 256 keeps `get` cheap.
 pub(crate) const SELECT_Q: usize = 256;
+
+/// Zeros per select-zero superblock: one direct lookup lands within
+/// [`SELECT0_SUPER`] zeros of the target, then the sub-samples narrow it to
+/// [`SELECT0_SUB`].
+pub(crate) const SELECT0_SUPER: usize = 1024;
+
+/// Zeros per select-zero subblock; the post-lookup scan is at most this many
+/// zeros, i.e. one or two 64-bit words.
+pub(crate) const SELECT0_SUB: usize = 64;
 
 /// `floor(log2(universe / n))`, the low-bit width that caps the high
 /// bitvector at between `2n` and `3n` bits.
@@ -95,10 +113,46 @@ pub fn encode(universe: u32, list: &[u32], out: &mut Vec<u8>) {
     if n == 0 {
         return;
     }
+    let lows_bytes = (n * l as usize).div_ceil(8);
+    let highs_start = 1 + lows_bytes;
+    let highs_bits = n + (u64::from(universe) >> l) as usize;
     encode_parts(universe, l, 0, list, out);
+    // Select-one samples: every SELECT_Q-th one's position, for get().
     for (i, &v) in list.iter().enumerate().step_by(SELECT_Q) {
         let pos = (u64::from(v) >> l) as usize + i;
         out.extend_from_slice(&(pos as u32).to_le_bytes());
+    }
+    // Select-zero samples: superblock positions plus subblock offsets, for
+    // O(1) seek. Built by walking the highs' zero bits.
+    let zeros = (u64::from(universe) >> l) as usize;
+    let mut super_samples = Vec::with_capacity(zeros.div_ceil(SELECT0_SUPER));
+    let mut sub_samples = Vec::with_capacity(zeros.div_ceil(SELECT0_SUB));
+    let mut zeros_seen = 0usize;
+    let mut super_base = 0usize;
+    for word_index in 0..highs_bits.div_ceil(64) {
+        let mut word = !word_at(out, highs_start * 8 + word_index * 64);
+        if word_index * 64 + 64 > highs_bits {
+            word &= trailing_mask(highs_bits - word_index * 64);
+        }
+        while word != 0 {
+            let pos = word_index * 64 + word.trailing_zeros() as usize;
+            if zeros_seen.is_multiple_of(SELECT0_SUPER) {
+                super_base = pos;
+                super_samples.push(pos as u32);
+            }
+            if zeros_seen.is_multiple_of(SELECT0_SUB) {
+                sub_samples.push((pos - super_base) as u16);
+            }
+            zeros_seen += 1;
+            word &= word - 1;
+        }
+    }
+    debug_assert_eq!(zeros_seen, zeros);
+    for &s in &super_samples {
+        out.extend_from_slice(&s.to_le_bytes());
+    }
+    for &s in &sub_samples {
+        out.extend_from_slice(&s.to_le_bytes());
     }
 }
 
@@ -113,10 +167,15 @@ pub fn decode(universe: u32, n: usize, buf: &[u8], out: &mut Vec<u32>) {
     decode_parts(l, n, &buf[1..], 0, out);
 }
 
-/// Bytes the select samples occupy, reported as the index overhead.
+/// Bytes the select samples occupy, reported as the index overhead: the
+/// select-one samples plus the select-zero super/sub samples.
 pub fn aux_len(universe: u32, n: usize) -> usize {
-    let _ = universe;
-    n.div_ceil(SELECT_Q) * 4
+    if n == 0 {
+        return 0;
+    }
+    let l = low_width(universe, n);
+    let zeros = (u64::from(universe) >> l) as usize;
+    n.div_ceil(SELECT_Q) * 4 + zeros.div_ceil(SELECT0_SUPER) * 4 + zeros.div_ceil(SELECT0_SUB) * 2
 }
 
 /// The `i`-th value by ordinal, via the select samples.
@@ -139,37 +198,62 @@ pub(crate) struct Layout<'a> {
     /// Bit offset of the highs within `buf`. One positions are relative to
     /// this, so an element's high part is `pos - index`.
     highs_bit: usize,
+    highs_bits: usize,
+    /// Byte offset of the select-one samples (positions of every
+    /// [`SELECT_Q`]th one).
     samples_start: usize,
     sample_count: usize,
+    /// Byte offset of the select-zero super samples, or 0 when absent (the
+    /// [`pef`] upper level has none and falls back to a sample binary
+    /// search).
+    s0_super_start: usize,
+    s0_sub_start: usize,
 }
 
 impl<'a> Layout<'a> {
-    /// Parse the full `[l: u8][lows][highs][samples]` format.
+    /// Parse the full `[l: u8][lows][highs][select1][select0]` format.
     pub(crate) fn with_samples(universe: u32, n: usize, buf: &'a [u8]) -> Self {
         let l = u32::from(buf[0]);
         let lows_bytes = (n * l as usize).div_ceil(8);
+        let highs_bit = (1 + lows_bytes) * 8;
         let highs_bits = n + (u64::from(universe) >> l) as usize;
         let samples_start = 1 + lows_bytes + highs_bits.div_ceil(8);
-        Self::from_parts_at(l, n, buf, 8, samples_start)
+        let zeros = (u64::from(universe) >> l) as usize;
+        let s0_super_start = samples_start + n.div_ceil(SELECT_Q) * 4;
+        let s0_sub_start = s0_super_start + zeros.div_ceil(SELECT0_SUPER) * 4;
+        Self {
+            buf,
+            n,
+            l,
+            lows_bit: 8,
+            highs_bit,
+            highs_bits,
+            samples_start,
+            sample_count: n.div_ceil(SELECT_Q),
+            s0_super_start,
+            s0_sub_start,
+        }
     }
-
     /// Parse a bare `[lows][highs]` pair (no `l` byte, no samples).
-    pub(crate) fn from_parts(l: u32, n: usize, buf: &'a [u8]) -> Self {
-        Self::from_parts_at(l, n, buf, 0, 0)
+    pub(crate) fn from_parts(l: u32, n: usize, universe: u32, buf: &'a [u8]) -> Self {
+        Self::from_parts_at(l, n, universe, buf, 0, 0)
     }
 
     /// Parse a `[lows][highs]` pair at bit `lows_bit` of `buf`, with the
-    /// select samples at byte `samples_start` (0 when absent). `pef` uses
-    /// this for its upper-level EF, whose samples live after the payload.
+    /// select-one samples at byte `samples_start` (0 when absent). `pef` uses
+    /// this for its upper-level EF, whose samples live after the payload and
+    /// which carries no select-zero index.
     pub(crate) fn from_parts_at(
         l: u32,
         n: usize,
+        universe: u32,
         buf: &'a [u8],
         lows_bit: usize,
         samples_start: usize,
     ) -> Self {
         let lows_bytes = (n * l as usize).div_ceil(8);
         let highs_bit = lows_bit / 8 * 8 + lows_bytes * 8;
+        let highs_bits = n + (u64::from(universe) >> l) as usize;
         let sample_count = if samples_start > 0 {
             n.div_ceil(SELECT_Q)
         } else {
@@ -181,8 +265,11 @@ impl<'a> Layout<'a> {
             l,
             lows_bit,
             highs_bit,
+            highs_bits,
             samples_start,
             sample_count,
+            s0_super_start: 0,
+            s0_sub_start: 0,
         }
     }
 
@@ -219,15 +306,21 @@ impl<'a> Layout<'a> {
         ((u64::from(high) << self.l) | u64::from(low)) as u32
     }
 
-    /// Position of the next one strictly after `pos`.
-    pub(crate) fn next_one_after(&self, pos: usize) -> usize {
+    /// Position of the next one strictly after `pos`, or `None` past the end.
+    pub(crate) fn next_one_after(&self, pos: usize) -> Option<usize> {
+        if pos >= self.highs_bits {
+            return None;
+        }
         let mut word_index = pos / 64;
         let mut word = self.word_at_rel(word_index) & mask_above(pos % 64 + 1);
         loop {
             if word != 0 {
-                return word_index * 64 + word.trailing_zeros() as usize;
+                return Some(word_index * 64 + word.trailing_zeros() as usize);
             }
             word_index += 1;
+            if word_index * 64 >= self.highs_bits {
+                return None;
+            }
             word = self.word_at_rel(word_index);
         }
     }
@@ -293,26 +386,84 @@ impl<'a> Layout<'a> {
         }
     }
 
-    /// Land just before the first element with high part `>= target >> l`,
-    /// returning a rank/position to start a forward scan from. Uses the
-    /// samples to binary-search the high part, so a seek never walks the
-    /// highs linearly.
+    /// Land on the first element with high part `>= target >> l`, returning its
+    /// rank and one position to start a forward scan from. With a select-zero
+    /// index this is two direct loads plus a word scan; without one (the
+    /// [`pef`] upper level) it binary-searches the select-one samples.
+    ///
+    /// [`pef`]: crate::pef
     pub(crate) fn land(&self, target: u32) -> Option<(usize, usize)> {
         let target_high = (u64::from(target) >> self.l) as usize;
-        let (mut lo, mut hi) = (0usize, self.sample_count);
-        while lo < hi {
-            let mid = (lo + hi) / 2;
-            let pos = self.sample_position(mid);
-            if pos - mid * SELECT_Q < target_high {
-                lo = mid + 1;
+        if self.s0_super_start > 0 {
+            if target_high == 0 {
+                return Some((0, self.select_one(0)));
+            }
+            let zeros_total = self.highs_bits - self.n;
+            if target_high > zeros_total {
+                return None;
+            }
+            // The (target_high-1)-th zero (0-indexed) sits just before the
+            // elements with high == target_high; the first one after it is
+            // the first element with high >= target_high.
+            let z = self.select_zero(target_high - 1);
+            let index = z - (target_high - 1);
+            let pos = self.next_one_after(z)?;
+            Some((index, pos))
+        } else {
+            let (mut lo, mut hi) = (0usize, self.sample_count);
+            while lo < hi {
+                let mid = (lo + hi) / 2;
+                let pos = self.sample_position(mid);
+                if pos - mid * SELECT_Q < target_high {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
+            }
+            if lo == 0 {
+                Some((0, self.sample_position(0)))
             } else {
-                hi = mid;
+                Some(((lo - 1) * SELECT_Q, self.sample_position(lo - 1)))
             }
         }
-        if lo == 0 {
-            return Some((0, self.sample_position(0)));
+    }
+
+    /// Position of the `k`-th zero (0-indexed, so `k` zeros lie before it),
+    /// via the super/sub samples and at most [`SELECT0_SUB`] zeros of scan.
+    fn select_zero(&self, k: usize) -> usize {
+        let super_index = k / SELECT0_SUPER;
+        let base = u32::from_le_bytes([
+            self.buf[self.s0_super_start + super_index * 4],
+            self.buf[self.s0_super_start + super_index * 4 + 1],
+            self.buf[self.s0_super_start + super_index * 4 + 2],
+            self.buf[self.s0_super_start + super_index * 4 + 3],
+        ]) as usize;
+        let sub_index = k / SELECT0_SUB;
+        let sub_bytes =
+            &self.buf[self.s0_sub_start + sub_index * 2..self.s0_sub_start + sub_index * 2 + 2];
+        let start = base + usize::from(u16::from_le_bytes([sub_bytes[0], sub_bytes[1]]));
+        let mut reminder = k % SELECT0_SUB;
+        let mut word_index = start / 64;
+        let mut word = !self.word_at_rel(word_index) & mask_above(start % 64);
+        if word_index * 64 + 64 > self.highs_bits {
+            word &= trailing_mask(self.highs_bits - word_index * 64);
         }
-        Some(((lo - 1) * SELECT_Q, self.sample_position(lo - 1)))
+        loop {
+            let zeros = word.count_ones() as usize;
+            if reminder < zeros {
+                let mut w = word;
+                for _ in 0..reminder {
+                    w &= w - 1;
+                }
+                return word_index * 64 + w.trailing_zeros() as usize;
+            }
+            reminder -= zeros;
+            word_index += 1;
+            word = !self.word_at_rel(word_index);
+            if word_index * 64 + 64 > self.highs_bits {
+                word &= trailing_mask(self.highs_bits - word_index * 64);
+            }
+        }
     }
 
     fn sample_position(&self, k: usize) -> usize {
@@ -325,9 +476,14 @@ impl<'a> Layout<'a> {
         ]) as usize
     }
 
-    /// The highs word `word_index` (positions relative to the highs start).
+    /// The highs word `word_index` (positions relative to the highs start),
+    /// masked to the `highs_bits` so padding bits past the end read as zero.
     fn word_at_rel(&self, word_index: usize) -> u64 {
-        word_at(self.buf, self.highs_bit + word_index * 64)
+        let mut word = word_at(self.buf, self.highs_bit + word_index * 64);
+        if word_index * 64 + 64 > self.highs_bits {
+            word &= trailing_mask(self.highs_bits - word_index * 64);
+        }
+        word
     }
 }
 
@@ -340,6 +496,15 @@ fn word_at(buf: &[u8], pos: usize) -> u64 {
 /// overflow in debug builds).
 fn mask_above(bit: usize) -> u64 {
     if bit >= 64 { 0 } else { u64::MAX << bit }
+}
+
+/// The low `bits` bits set, or all ones when `bits >= 64`.
+fn trailing_mask(bits: usize) -> u64 {
+    if bits >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << bits) - 1
+    }
 }
 
 /// Skip cursor over one list, with Lucene `advance` semantics.
@@ -420,7 +585,10 @@ impl crate::Cursor for Cursor<'_> {
             if index >= self.layout.n {
                 return self.exhaust();
             }
-            (index, self.layout.next_one_after(self.pos))
+            let Some(pos) = self.layout.next_one_after(self.pos) else {
+                return self.exhaust();
+            };
+            (index, pos)
         };
         let value = self.layout.value_at(index, pos);
         self.index = index;
