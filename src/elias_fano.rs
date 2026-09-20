@@ -1,5 +1,4 @@
-//! Elias-Fano encoding of a strictly increasing `u32` list with a sampled
-//! select index, so a fresh seek jumps instead of walking the highs.
+//! Elias-Fano encoding of a strictly increasing `u32` list.
 //!
 //! Each value splits into `l = floor(log2(universe / n))` low bits and a
 //! high part `value >> l`. The low parts are stored contiguously; the high
@@ -7,15 +6,8 @@
 //! `(value >> l) + index`, so the high part of element `i` equals the number
 //! of zeros before its one.
 //!
-//! Two sample structures follow long bitvectors. The **select-one samples**
-//! have `u32` anchors every [`SELECT1_SUPER`] ones and `u16` offsets every
-//! [`SELECT1_SUB`] ones, and answer `get(i)` by rank. The **select-zero
-//! samples** are the positions of every
-//! [`SELECT0_SUPER`]th zero (a `u32` each) plus, for every [`SELECT0_SUB`]th
-//! zero, its offset within the superblock (a `u16`); a seek reads them
-//! directly by zero-rank to land on the 64-bit word containing the first
-//! element with the target's high part, so `next_geq` is O(1)-ish instead of
-//! a binary search over the whole bitvector.
+//! Long bitvectors carry two-level select-one samples (`u32` every 1024 ones,
+//! `u16` every 64) for `get`, and matching select-zero samples for seek.
 //!
 //! Byte layout, all sections byte-aligned:
 //!
@@ -26,31 +18,19 @@
 //! [select0 sub: ceil(z / SELECT0_SUB) * u16]   z = universe >> l
 //! ```
 //!
-//! All sample sections are omitted when the highs fit in
-//! [`SAMPLE_THRESHOLD_WORDS`] 64-bit words: scanning those words costs less
-//! than carrying an index, especially across many short lists.
+//! Samples are omitted when the highs fit in 16 words: scanning costs less
+//! than carrying an index across short lists.
 //!
 //! `n` and `universe` are stored out of band by the caller. Empty lists
 //! encode to a single `l = 0` byte and decode to nothing.
-//!
-//! [`SELECT1_SUPER`]: self::SELECT1_SUPER
-//! [`SELECT1_SUB`]: self::SELECT1_SUB
-//! [`SELECT0_SUPER`]: self::SELECT0_SUPER
-//! [`SELECT0_SUB`]: self::SELECT0_SUB
 
-use crate::bits::{Reader, Writer};
+use crate::bits::{self, Reader, Writer};
 
 pub(crate) const SELECT1_SUPER: usize = 1024;
 const SELECT1_SUB: usize = 64;
 pub(crate) const SAMPLE_THRESHOLD_WORDS: usize = 16;
 
-/// Zeros per select-zero superblock: one direct lookup lands within
-/// [`SELECT0_SUPER`] zeros of the target, then the sub-samples narrow it to
-/// [`SELECT0_SUB`].
 pub(crate) const SELECT0_SUPER: usize = 1024;
-
-/// Zeros per select-zero subblock; the post-lookup scan is at most this many
-/// zeros, i.e. one or two 64-bit words.
 pub(crate) const SELECT0_SUB: usize = 64;
 
 pub(crate) fn has_samples(highs_bits: usize) -> bool {
@@ -72,12 +52,8 @@ pub(crate) fn low_width(universe: u32, n: usize) -> u32 {
     (u64::BITS - quotient.leading_zeros()).saturating_sub(1)
 }
 
-/// The shared low/high pair: `[lows][highs]` with no `l` byte and no select
-/// samples, byte-aligned between the sections. This is what a [`pef`] EF
-/// partition stores, so both codecs build their payloads with one routine.
-/// `base` shifts the values (partition-local values are `value - start`).
-///
-/// [`pef`]: crate::pef
+/// Bare byte-aligned `[lows][highs]`, shared with PEF partitions. `base`
+/// shifts partition-local values.
 pub(crate) fn encode_parts(universe: u32, l: u32, base: u32, list: &[u32], out: &mut Vec<u8>) {
     let n = list.len();
     let mut writer = Writer::new(out);
@@ -155,10 +131,7 @@ pub(crate) fn encode_select1(list: &[u32], l: u32, out: &mut Vec<u8>) {
     }
 }
 
-/// Select-zero super/sub samples for a `[lows][highs]` pair, built by walking
-/// the highs' zero bits. Shared by the full format and [`pef`]'s upper level.
-///
-/// [`pef`]: crate::pef
+/// Select-zero super/sub samples, built by walking the highs' zero bits.
 pub(crate) fn encode_select0_bytes(universe: u32, l: u32, n: usize, highs: &[u8]) -> Vec<u8> {
     let zeros = (u64::from(universe) >> l) as usize;
     let highs_bits = n + zeros;
@@ -224,10 +197,25 @@ pub fn aux_len(universe: u32, n: usize) -> usize {
 }
 /// The `i`-th value by ordinal, via the select samples.
 pub fn get(universe: u32, n: usize, buf: &[u8], i: usize) -> u32 {
-    assert!(i < n, "elias_fano::get({i}) out of range (n={n})");
-    let layout = Layout::with_samples(universe, n, buf);
-    let pos = layout.select_one(i);
-    layout.value_at(i, pos)
+    View::new(universe, n, buf).get(i)
+}
+
+/// A zero-copy list opened once for repeated queries.
+pub struct View<'a>(Layout<'a>);
+
+impl<'a> View<'a> {
+    pub fn new(universe: u32, n: usize, buf: &'a [u8]) -> Self {
+        Self(Layout::with_samples(universe, n, buf))
+    }
+
+    pub fn get(&self, i: usize) -> u32 {
+        assert!(i < self.0.n, "elias_fano::get({i}) out of range");
+        self.0.value_at(i, self.0.select_one(i))
+    }
+
+    pub fn cursor(&self) -> Cursor<'a> {
+        Cursor::from_layout(self.0)
+    }
 }
 
 /// Byte offsets of the select sample structures within a buffer.
@@ -235,31 +223,22 @@ pub fn get(universe: u32, n: usize, buf: &[u8], i: usize) -> u32 {
 pub(crate) struct SampleIndex {
     pub(crate) select1_super: usize,
     pub(crate) select1_sub: usize,
-    /// Select-zero super samples (positions of every [`SELECT0_SUPER`]th zero).
     pub(crate) select0_super: usize,
-    /// Select-zero sub samples (offsets of every [`SELECT0_SUB`]th zero).
     pub(crate) select0_sub: usize,
 }
 
-/// Layout of one encoded list, shared between the full format and a bare
-/// `[lows][highs]` sub-slice ([`Layout::from_parts`], used by [`pef`]).
-///
-/// [`pef`]: crate::pef
+/// Parsed byte offsets for a full EF list or a bare PEF `[lows][highs]`.
+#[derive(Clone, Copy)]
 pub(crate) struct Layout<'a> {
     pub(crate) buf: &'a [u8],
     pub(crate) n: usize,
     pub(crate) l: u32,
     lows_bit: usize,
-    /// Bit offset of the highs within `buf`. One positions are relative to
-    /// this, so an element's high part is `pos - index`.
     highs_bit: usize,
     highs_bits: usize,
     s1_super_start: usize,
     s1_sub_start: usize,
     sample_count: usize,
-    /// Byte offset of the select-zero super samples, or 0 when absent (the
-    /// [`pef`] upper level has none and falls back to a sample binary
-    /// search).
     s0_super_start: usize,
     s0_sub_start: usize,
 }
@@ -269,7 +248,6 @@ impl<'a> Layout<'a> {
     pub(crate) fn with_samples(universe: u32, n: usize, buf: &'a [u8]) -> Self {
         let l = u32::from(buf[0]);
         let lows_bytes = (n * l as usize).div_ceil(8);
-        let highs_bit = (1 + lows_bytes) * 8;
         let highs_bits = n + (u64::from(universe) >> l) as usize;
         let samples_start = 1 + lows_bytes + highs_bits.div_ceil(8);
         let zeros = (u64::from(universe) >> l) as usize;
@@ -285,19 +263,7 @@ impl<'a> Layout<'a> {
         } else {
             SampleIndex::default()
         };
-        Self {
-            buf,
-            n,
-            l,
-            lows_bit: 8,
-            highs_bit,
-            highs_bits,
-            s1_super_start: samples.select1_super,
-            s1_sub_start: samples.select1_sub,
-            sample_count: usize::from(samples.select1_super > 0) * n.div_ceil(SELECT1_SUPER),
-            s0_super_start: samples.select0_super,
-            s0_sub_start: samples.select0_sub,
-        }
+        Self::from_parts_at(l, n, universe, buf, 8, samples)
     }
     /// Parse a bare `[lows][highs]` pair (no `l` byte, no samples).
     pub(crate) fn from_parts(l: u32, n: usize, universe: u32, buf: &'a [u8]) -> Self {
@@ -318,11 +284,7 @@ impl<'a> Layout<'a> {
         let lows_bytes = (n * l as usize).div_ceil(8);
         let highs_bit = lows_bit / 8 * 8 + lows_bytes * 8;
         let highs_bits = n + (u64::from(universe) >> l) as usize;
-        let sample_count = if samples.select1_super > 0 {
-            n.div_ceil(SELECT1_SUPER)
-        } else {
-            0
-        };
+        let sample_count = usize::from(samples.select1_super > 0) * n.div_ceil(SELECT1_SUPER);
         Self {
             buf,
             n,
@@ -351,11 +313,7 @@ impl<'a> Layout<'a> {
         loop {
             let ones = word.count_ones() as usize;
             if rest <= ones {
-                let mut w = word;
-                for _ in 0..rest - 1 {
-                    w &= w - 1;
-                }
-                return word_index * 64 + w.trailing_zeros() as usize;
+                return word_index * 64 + bits::select_one(word, rest - 1) as usize;
             }
             rest -= ones;
             word_index += 1;
@@ -363,8 +321,7 @@ impl<'a> Layout<'a> {
         }
     }
 
-    /// The element at rank `i` whose one is at bit `pos` (relative to the
-    /// highs).
+    /// Value at rank `i`, whose one is at `pos` relative to the highs.
     pub(crate) fn value_at(&self, i: usize, pos: usize) -> u32 {
         let high = (pos - i) as u32;
         let low = Reader::new(self.buf).get(self.lows_bit + i * self.l as usize, self.l) as u32;
@@ -451,12 +408,7 @@ impl<'a> Layout<'a> {
         }
     }
 
-    /// Land on the first element with high part `>= target >> l`, returning its
-    /// rank and one position to start a forward scan from. With a select-zero
-    /// index this is two direct loads plus a word scan; without one (the
-    /// [`pef`] upper level) it binary-searches the select-one samples.
-    ///
-    /// [`pef`]: crate::pef
+    /// Land near `target`; PEF without select-zero binary-searches select-one.
     pub(crate) fn land(&self, target: u32) -> Option<(usize, usize)> {
         let target_high = (u64::from(target) >> self.l) as usize;
         if self.s0_super_start > 0 {
@@ -516,11 +468,7 @@ impl<'a> Layout<'a> {
         loop {
             let zeros = word.count_ones() as usize;
             if reminder < zeros {
-                let mut w = word;
-                for _ in 0..reminder {
-                    w &= w - 1;
-                }
-                return word_index * 64 + w.trailing_zeros() as usize;
+                return word_index * 64 + bits::select_one(word, reminder) as usize;
             }
             reminder -= zeros;
             word_index += 1;
@@ -597,8 +545,12 @@ pub struct Cursor<'a> {
 
 impl<'a> Cursor<'a> {
     pub fn new(universe: u32, n: usize, buf: &'a [u8]) -> Self {
+        Self::from_layout(Layout::with_samples(universe, n, buf))
+    }
+
+    fn from_layout(layout: Layout<'a>) -> Self {
         Self {
-            layout: Layout::with_samples(universe, n, buf),
+            layout,
             index: usize::MAX,
             pos: 0,
             cur: None,
@@ -749,13 +701,14 @@ mod tests {
 
     #[test]
     fn get_crosses_samples() {
-        let universe = 1 << 30;
-        let n = 3 * SELECT1_SUPER + 10;
-        let list: Vec<u32> = (0..n as u32).map(|i| i * 37 + 5).collect();
+        let universe = u32::MAX;
+        let mut list: Vec<u32> = (0..50_000).collect();
+        list.extend((1 << 31)..(1 << 31) + 50_000);
+        let n = list.len();
         let mut buf = Vec::new();
         encode(universe, &list, &mut buf);
-        for (i, &v) in list.iter().enumerate() {
-            assert_eq!(get(universe, n, &buf, i), v);
+        for i in [0, 63, 1023, 49_999, 50_000, 50_063, n - 1] {
+            assert_eq!(get(universe, n, &buf, i), list[i]);
         }
     }
 

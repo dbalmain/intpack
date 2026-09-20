@@ -126,6 +126,38 @@ impl<'a> Reader<'a> {
     }
 }
 
+/// Bit position of the `rank`-th one in `word` (zero-indexed).
+///
+/// The portable kernel narrows by popcount halves; BMI2 maps it to `pdep`.
+#[inline]
+#[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+pub(crate) fn select_one(mut word: u64, mut rank: usize) -> u32 {
+    debug_assert!(rank < word.count_ones() as usize);
+    let mut offset = 0;
+    for width in [32, 16, 8, 4, 2, 1] {
+        let mask = (1u64 << width) - 1;
+        let lower = word & mask;
+        let ones = lower.count_ones() as usize;
+        if rank < ones {
+            word = lower;
+        } else {
+            rank -= ones;
+            word >>= width;
+            offset += width;
+        }
+    }
+    offset
+}
+
+#[inline]
+#[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+pub(crate) fn select_one(word: u64, rank: usize) -> u32 {
+    use core::arch::x86_64::_pdep_u64;
+
+    // SAFETY: this implementation is compiled only when BMI2 is enabled.
+    unsafe { _pdep_u64(1 << rank, word) }.trailing_zeros()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -182,5 +214,14 @@ mod tests {
         let r = Reader::new(&[0xff, 0xff]);
         assert_eq!(r.get(8, 16), 0xff);
         assert_eq!(r.word(16), 0);
+    }
+
+    #[test]
+    fn selects_each_one() {
+        let word = 0x8100_0400_0000_1021;
+        let positions: Vec<u32> = (0..64).filter(|&bit| word >> bit & 1 == 1).collect();
+        for (rank, position) in positions.into_iter().enumerate() {
+            assert_eq!(select_one(word, rank), position);
+        }
     }
 }

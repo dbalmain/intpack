@@ -1,13 +1,9 @@
 //! Fixed-128 partitioned Elias-Fano over strictly increasing `u32` lists.
 //!
-//! The upper level is a plain Elias-Fano sequence of partition maxima; a
-//! packed two-bit directory selects all-ones, bitmap, or Elias-Fano storage
-//! per partition; a fixed-width packed offset directory addresses the
-//! byte-aligned payloads; and, new versus the reference `pef`, the upper
-//! level's select samples let a fresh seek jump straight to the target
-//! partition instead of binary-searching with a linear select each time.
-//! Elias-Fano partitions reuse [`elias_fano`]'s low/high primitives on a
-//! sub-slice rather than carrying a second copy of them.
+//! The upper level Elias-Fano encodes partition maxima. A packed directory
+//! selects all-ones, bitmap, or Elias-Fano partitions and addresses their
+//! byte-aligned payloads. Long upper levels carry select samples for seek;
+//! EF partitions reuse [`elias_fano`]'s low/high primitives.
 //!
 //! Byte layout:
 //!
@@ -23,7 +19,7 @@
 //! `n` and `universe` are stored out of band by the caller. Empty lists
 //! encode to an empty buffer.
 
-use crate::bits::{Reader, Writer};
+use crate::bits::{self, Reader, Writer};
 use crate::elias_fano::{self, Layout as EfLayout, SampleIndex};
 
 const PARTITION_SIZE: usize = 128;
@@ -128,7 +124,6 @@ pub fn decode(universe: u32, n: usize, buf: &[u8], out: &mut Vec<u32>) {
         }
     }
 }
-
 /// Bytes the header, type directory, and upper select samples occupy. The
 /// packed offset directory is excluded because its width is stored in the
 /// encoded buffer; callers with the buffer should use [`aux_bytes`].
@@ -151,7 +146,6 @@ pub fn aux_bytes(universe: u32, n: usize, buf: &[u8]) -> usize {
     let partition_count = n.div_ceil(PARTITION_SIZE);
     aux_len(universe, n) + (partition_count * usize::from(buf[1])).div_ceil(8)
 }
-
 /// The `i`-th value by ordinal.
 pub fn get(universe: u32, n: usize, buf: &[u8], i: usize) -> u32 {
     assert!(i < n, "pef::get({i}) out of range (n={n})");
@@ -205,11 +199,7 @@ fn find_nth_one(bytes: &[u8], bit_len: usize, rank: usize) -> Option<usize> {
         }
         let ones = word.count_ones() as usize;
         if remaining < ones {
-            let mut w = word;
-            for _ in 0..remaining {
-                w &= w - 1;
-            }
-            return Some(word_index * 64 + w.trailing_zeros() as usize);
+            return Some(word_index * 64 + bits::select_one(word, remaining) as usize);
         }
         remaining -= ones;
     }
