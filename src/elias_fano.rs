@@ -109,6 +109,7 @@ pub(crate) fn decode_parts(l: u32, n: usize, buf: &[u8], base: u32, out: &mut Ve
 pub fn encode(universe: u32, list: &[u32], out: &mut Vec<u8>) {
     let n = list.len();
     let l = low_width(universe, n);
+    let list_start = out.len();
     out.push(l as u8);
     if n == 0 {
         return;
@@ -130,7 +131,7 @@ pub fn encode(universe: u32, list: &[u32], out: &mut Vec<u8>) {
     let mut zeros_seen = 0usize;
     let mut super_base = 0usize;
     for word_index in 0..highs_bits.div_ceil(64) {
-        let mut word = !word_at(out, highs_start * 8 + word_index * 64);
+        let mut word = !word_at(out, (list_start + highs_start) * 8 + word_index * 64);
         if word_index * 64 + 64 > highs_bits {
             word &= trailing_mask(highs_bits - word_index * 64);
         }
@@ -154,6 +155,10 @@ pub fn encode(universe: u32, list: &[u32], out: &mut Vec<u8>) {
     for &s in &sub_samples {
         out.extend_from_slice(&s.to_le_bytes());
     }
+    // Trailing marker so `aux_bytes` can report the select index without
+    // needing `universe` (the harness passes only `n` and the buffer).
+    let aux = out.len() - list_start - 1 - lows_bytes - highs_bits.div_ceil(8);
+    out.extend_from_slice(&(aux as u32).to_le_bytes());
 }
 
 /// Reconstruct exactly the `n` values `encode` produced for them, appending
@@ -166,7 +171,6 @@ pub fn decode(universe: u32, n: usize, buf: &[u8], out: &mut Vec<u32>) {
     let l = u32::from(buf[0]);
     decode_parts(l, n, &buf[1..], 0, out);
 }
-
 /// Bytes the select samples occupy, reported as the index overhead: the
 /// select-one samples plus the select-zero super/sub samples.
 pub fn aux_len(universe: u32, n: usize) -> usize {
@@ -178,6 +182,16 @@ pub fn aux_len(universe: u32, n: usize) -> usize {
     n.div_ceil(SELECT_Q) * 4 + zeros.div_ceil(SELECT0_SUPER) * 4 + zeros.div_ceil(SELECT0_SUB) * 2
 }
 
+/// The select-index byte count from an encoded buffer, via the trailing
+/// marker `encode` wrote — for callers that hold the buffer but not
+/// `universe`.
+pub fn aux_bytes(buf: &[u8]) -> usize {
+    if buf.len() < 5 {
+        return 0;
+    }
+    let b = &buf[buf.len() - 4..];
+    u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize
+}
 /// The `i`-th value by ordinal, via the select samples.
 pub fn get(universe: u32, n: usize, buf: &[u8], i: usize) -> u32 {
     assert!(i < n, "elias_fano::get({i}) out of range (n={n})");
