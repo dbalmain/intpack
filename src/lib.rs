@@ -42,5 +42,7 @@
 pub mod bits;
 pub mod cursor;
 pub mod delta;
+pub mod elias_fano;
+pub mod pef;
 
 pub use cursor::Cursor;
