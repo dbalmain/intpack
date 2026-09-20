@@ -315,11 +315,12 @@ fn decode_sorted_scalar(n: usize, buf: &[u8], out: &mut Vec<u32>) {
 mod kernel {
     use super::{DATA_LEN, DECODE_SHUFFLE, ENCODE_SHUFFLE, write_group_at};
 
+    use crate::delta;
+
     use std::arch::x86_64::{
-        __m128i, _mm_add_epi32, _mm_adds_epu16, _mm_alignr_epi8, _mm_bslli_si128, _mm_loadu_si128,
-        _mm_min_epi16, _mm_min_epu8, _mm_movemask_epi8, _mm_packus_epi16, _mm_set1_epi8,
-        _mm_set1_epi16, _mm_set1_epi32, _mm_setr_epi32, _mm_shuffle_epi8, _mm_shuffle_epi32,
-        _mm_storeu_si128, _mm_sub_epi32,
+        __m128i, _mm_adds_epu16, _mm_alignr_epi8, _mm_loadu_si128, _mm_min_epi16, _mm_min_epu8,
+        _mm_movemask_epi8, _mm_packus_epi16, _mm_set1_epi8, _mm_set1_epi16, _mm_set1_epi32,
+        _mm_setr_epi32, _mm_shuffle_epi8, _mm_storeu_si128, _mm_sub_epi32,
     };
 
     /// Load 16 data bytes, zero-padding if fewer than 16 remain.
@@ -337,13 +338,6 @@ mod kernel {
             core::ptr::copy_nonoverlapping(ptr, tmp.as_mut_ptr(), remain);
         }
         _mm_loadu_si128(tmp.as_ptr().cast())
-    }
-
-    #[inline]
-    #[target_feature(enable = "ssse3")]
-    fn prefix4(d: __m128i) -> __m128i {
-        let t = _mm_add_epi32(d, _mm_bslli_si128(d, 4));
-        _mm_add_epi32(t, _mm_bslli_si128(t, 8))
     }
 
     #[inline]
@@ -507,21 +501,19 @@ mod kernel {
         let n_full = n / 4;
         let out = dst.as_mut_ptr();
         let mut dp = 0usize;
-        let ones = _mm_setr_epi32(1, 2, 3, 4);
-        let first_add = _mm_setr_epi32(0, 1, 2, 3);
+        let head = _mm_set1_epi32(delta::carried(None) as i32);
 
         if n_full == 0 {
             let (deltas, _) = shuffle_at(tags, data, 0, 0, data_len);
-            let vals = _mm_add_epi32(prefix4(deltas), first_add);
+            let vals = delta::simd::values(head, deltas);
             let mut tmp = [0u32; 4];
             _mm_storeu_si128(tmp.as_mut_ptr().cast(), vals);
             core::ptr::copy_nonoverlapping(tmp.as_ptr(), out, n);
             return;
         }
 
-        // First group: prefix + [0,1,2,3].
         let (deltas, len) = shuffle_at(tags, data, 0, 0, data_len);
-        let mut prev = _mm_add_epi32(prefix4(deltas), first_add);
+        let mut prev = delta::simd::values(head, deltas);
         _mm_storeu_si128(out.cast(), prev);
         dp += len;
         let mut g = 1usize;
@@ -529,10 +521,7 @@ mod kernel {
             let tag = *tags.add(g);
             let shuf = _mm_loadu_si128(DECODE_SHUFFLE[tag as usize].as_ptr().cast());
             let deltas = _mm_shuffle_epi8(_mm_loadu_si128(data.add(dp).cast()), shuf);
-            let vals = _mm_add_epi32(
-                prefix4(deltas),
-                _mm_add_epi32(_mm_shuffle_epi32(prev, 0xff), ones),
-            );
+            let vals = delta::simd::values(prev, deltas);
             _mm_storeu_si128(out.add(g * 4).cast(), vals);
             prev = vals;
             dp += DATA_LEN[tag as usize] as usize;
@@ -540,10 +529,7 @@ mod kernel {
         }
         while g < n_full {
             let (deltas, len) = shuffle_at(tags, data, g, dp, data_len - dp);
-            let vals = _mm_add_epi32(
-                prefix4(deltas),
-                _mm_add_epi32(_mm_shuffle_epi32(prev, 0xff), ones),
-            );
+            let vals = delta::simd::values(prev, deltas);
             _mm_storeu_si128(out.add(g * 4).cast(), vals);
             prev = vals;
             dp += len;
@@ -551,10 +537,7 @@ mod kernel {
         }
         if !n.is_multiple_of(4) {
             let (deltas, _) = shuffle_at(tags, data, g, dp, data_len.saturating_sub(dp));
-            let vals = _mm_add_epi32(
-                prefix4(deltas),
-                _mm_add_epi32(_mm_shuffle_epi32(prev, 0xff), ones),
-            );
+            let vals = delta::simd::values(prev, deltas);
             let mut tmp = [0u32; 4];
             _mm_storeu_si128(tmp.as_mut_ptr().cast(), vals);
             core::ptr::copy_nonoverlapping(tmp.as_ptr(), out.add(n_full * 4), n % 4);

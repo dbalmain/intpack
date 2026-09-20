@@ -14,9 +14,9 @@
 //! reinterprets a reference to exactly the 16 bytes the vector holds.
 
 use core::arch::x86_64::{
-    __m128i, _mm_add_epi32, _mm_and_si128, _mm_cvtsi32_si128, _mm_loadu_si128, _mm_or_si128,
-    _mm_set1_epi32, _mm_setzero_si128, _mm_shuffle_epi32, _mm_sll_epi32, _mm_slli_si128,
-    _mm_srl_epi32, _mm_srli_si128, _mm_storeu_si128, _mm_sub_epi32,
+    __m128i, _mm_and_si128, _mm_cvtsi32_si128, _mm_loadu_si128, _mm_or_si128, _mm_set1_epi32,
+    _mm_setzero_si128, _mm_sll_epi32, _mm_slli_si128, _mm_srl_epi32, _mm_srli_si128,
+    _mm_storeu_si128, _mm_sub_epi32,
 };
 
 use super::{BLOCK, mask};
@@ -158,7 +158,7 @@ pub fn unpack<const W: u32>(packed: &[u8], out: &mut [u32; BLOCK]) {
 pub fn unpack_sorted<const W: u32>(base: Option<u32>, packed: &[u8], out: &mut [u32; BLOCK]) {
     let mut prev = _mm_set1_epi32(delta::carried(base) as i32);
     unpack_with::<W>(packed, out, |gaps| {
-        prev = values(prev, gaps);
+        prev = delta::simd::values(prev, gaps);
         prev
     });
 }
@@ -191,7 +191,8 @@ fn unpack_with<const W: u32>(packed: &[u8], out: &mut [u32; BLOCK], mut emit: im
 // Both directions carry `prev`, the previous group of values, in the
 // `delta::carried` form: the head-of-list base is `u32::MAX`, so the first
 // gap is `v - MAX - 1 = v` and the first value `MAX + gap + 1 = gap`
-// (wrapping), which is the `None` rule without a branch.
+// (wrapping), which is the `None` rule without a branch. The inverse of
+// `gaps` is [`delta::simd::values`].
 
 /// The four gaps of the group `v` following `prev`: each lane less the lane
 /// before it, the first lane's predecessor being `prev`'s last, less one.
@@ -200,15 +201,4 @@ fn unpack_with<const W: u32>(packed: &[u8], out: &mut [u32; BLOCK], mut emit: im
 fn gaps(prev: V, v: V) -> V {
     let before = _mm_or_si128(_mm_slli_si128::<4>(v), _mm_srli_si128::<12>(prev));
     _mm_sub_epi32(_mm_sub_epi32(v, before), _mm_set1_epi32(1))
-}
-
-/// The four values following `prev`'s last lane, from four gaps: an in-vector
-/// inclusive prefix sum of `gap + 1`, plus that last value broadcast.
-#[inline]
-#[target_feature(enable = "sse2")]
-fn values(prev: V, gaps: V) -> V {
-    let x = _mm_add_epi32(gaps, _mm_set1_epi32(1));
-    let x = _mm_add_epi32(x, _mm_slli_si128::<4>(x));
-    let x = _mm_add_epi32(x, _mm_slli_si128::<8>(x));
-    _mm_add_epi32(x, _mm_shuffle_epi32::<0xff>(prev))
 }

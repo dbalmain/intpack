@@ -19,7 +19,7 @@
 //! [`bp128skip`]: crate::bp128skip
 
 use crate::bitpack::{self, BLOCK};
-use crate::{Cursor, delta};
+use crate::{Cursor, delta, vbyte};
 
 // ── blocks ──
 
@@ -86,39 +86,12 @@ pub(crate) fn block_len(buf: &[u8], byte: usize) -> usize {
 
 // ── tail ──
 
-/// LEB128 varints for the partial block: 7 bits per byte, low bits first,
-/// high bit set on every byte but the last.
-pub(crate) mod varint {
-    pub fn put(mut v: u32, out: &mut Vec<u8>) {
-        while v >= 0x80 {
-            out.push(v as u8 | 0x80);
-            v >>= 7;
-        }
-        out.push(v as u8);
-    }
-
-    /// Read the varint at `buf[*pos]`, advancing `*pos` past it.
-    pub fn take(buf: &[u8], pos: &mut usize) -> u32 {
-        let mut v = 0;
-        let mut shift = 0;
-        loop {
-            let b = buf[*pos];
-            *pos += 1;
-            v |= u32::from(b & 0x7f) << shift;
-            if b < 0x80 {
-                return v;
-            }
-            shift += 7;
-        }
-    }
-}
-
 /// Encode the sorted tail as gaps from `base`, the last full block's last
 /// value (`None` when the list has no full block).
 pub(crate) fn encode_tail_sorted(base: Option<u32>, tail: &[u32], out: &mut Vec<u8>) {
     let mut prev = base;
     for &v in tail {
-        varint::put(delta::gap(prev, v), out);
+        vbyte::put(delta::gap(prev, v), out);
         prev = Some(v);
     }
 }
@@ -133,7 +106,7 @@ pub(crate) fn decode_tail_sorted(
 ) {
     let mut prev = base;
     for _ in 0..n {
-        let v = delta::value(prev, varint::take(buf, byte));
+        let v = delta::value(prev, vbyte::take(buf, byte));
         out.push(v);
         prev = Some(v);
     }
@@ -141,13 +114,13 @@ pub(crate) fn decode_tail_sorted(
 
 pub(crate) fn encode_tail(tail: &[u32], out: &mut Vec<u8>) {
     for &v in tail {
-        varint::put(v, out);
+        vbyte::put(v, out);
     }
 }
 
 pub(crate) fn decode_tail(buf: &[u8], byte: &mut usize, n: usize, out: &mut Vec<u32>) {
     for _ in 0..n {
-        out.push(varint::take(buf, byte));
+        out.push(vbyte::take(buf, byte));
     }
 }
 
@@ -254,7 +227,7 @@ impl Cursor for SortedCursor<'_> {
             }
             self.block[self.pos % BLOCK]
         } else {
-            delta::value(self.cur, varint::take(self.buf, &mut self.byte))
+            delta::value(self.cur, vbyte::take(self.buf, &mut self.byte))
         };
         self.pos += 1;
         self.cur = Some(v);

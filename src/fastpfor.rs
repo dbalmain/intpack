@@ -1,17 +1,18 @@
 //! FastPFor (Lemire & Boytsov §6): pages of 128-int blocks. Per block, pick a
 //! bit width `b` minimising `128·b + exceptions·(maxbits − b)` plus 8 bits per
 //! exception (its position) and 8 bits to store `maxbits`; pack the low `b`
-//! bits, and collect exception high-parts into per-width arrays, themselves
-//! bit-packed. A `VariableByte` tail covers `n % 128`.
+//! bits through [`bitpack`], and collect exception high-parts into per-width
+//! arrays, themselves bit-packed with [`bits`]. A `VariableByte` tail covers
+//! `n % 128`.
 //!
 //! The on-disk layout is ours; the cost model matches the paper / the
-//! `fastpfor` crate, so density comes out the same. The block packer is a
-//! private scalar kernel — it will be replaced by the shared bitpack kernel.
+//! `fastpfor` crate, so density comes out the same. The 128-int payload is
+//! the shared bitpack kernel (four interleaved lanes). Exception arrays are
+//! a sequential LSB-first bit stream, byte-aligned, the cold path.
 
-use crate::delta;
-use crate::vbyte;
+use crate::bitpack::{self, BLOCK};
+use crate::{bits, delta, vbyte};
 
-const BLOCK: usize = 128;
 const PAGE: usize = 65536;
 const OVERHEAD_OF_EACH_EXCEPT: u32 = 8;
 
@@ -30,151 +31,16 @@ fn read_u32(buf: &[u8], pos: &mut usize) -> u32 {
     u32::from_le_bytes(bytes)
 }
 
-/// Pack 32 integers using `width` bits each, LSB-first.
-fn pack32(width: u32, src: &[u32], out: &mut Vec<u8>) {
-    debug_assert!(src.len() >= 32);
-    if width == 0 {
-        return;
-    }
-    let mask = if width >= 32 {
-        u64::from(u32::MAX)
-    } else {
-        (1u64 << width) - 1
-    };
-    let mut acc = 0u64;
-    let mut have = 0u32;
-    for &v in &src[..32] {
-        acc |= (u64::from(v) & mask) << have;
-        have += width;
-        if have >= 32 {
-            write_u32(out, acc as u32);
-            acc >>= 32;
-            have -= 32;
-        }
-    }
-    if have > 0 {
-        write_u32(out, acc as u32);
-    }
-}
-
-fn unpack32(width: u32, buf: &[u8], pos: &mut usize, dst: &mut [u32]) {
-    debug_assert!(dst.len() >= 32);
-    if width == 0 {
-        dst[..32].fill(0);
-        return;
-    }
-    let mask = if width >= 32 {
+fn low_mask(width: u32) -> u32 {
+    if width >= 32 {
         u32::MAX
     } else {
         (1u32 << width) - 1
-    };
-    let mut acc = 0u64;
-    let mut have = 0u32;
-    for slot in &mut dst[..32] {
-        if have < width {
-            acc |= u64::from(read_u32(buf, pos)) << have;
-            have += 32;
-        }
-        *slot = (acc as u32) & mask;
-        acc >>= width;
-        have -= width;
     }
-}
-
-/// Pack 128 integers at `width` bits. Temporary: will be replaced by the
-/// shared bitpack kernel.
-fn pack(width: u32, src: &[u32; 128], out: &mut Vec<u8>) {
-    for chunk in src.chunks_exact(32) {
-        pack32(width, chunk, out);
-    }
-}
-
-/// Unpack 128 integers at `width` bits. Temporary: will be replaced by the
-/// shared bitpack kernel.
-fn unpack(width: u32, buf: &[u8], pos: &mut usize, dst: &mut [u32]) {
-    debug_assert!(dst.len() >= BLOCK);
-    match width {
-        0 => dst[..BLOCK].fill(0),
-        1 => {
-            for slot_chunk in dst[..BLOCK].chunks_exact_mut(32) {
-                let word = read_u32(buf, pos);
-                for (bit, slot) in slot_chunk.iter_mut().enumerate() {
-                    *slot = (word >> bit) & 1;
-                }
-            }
-        }
-        8 => {
-            for (slot, &b) in dst[..BLOCK].iter_mut().zip(&buf[*pos..*pos + BLOCK]) {
-                *slot = u32::from(b);
-            }
-            *pos += BLOCK;
-        }
-        16 => {
-            for (slot, chunk) in dst[..BLOCK]
-                .iter_mut()
-                .zip(buf[*pos..*pos + BLOCK * 2].chunks_exact(2))
-            {
-                *slot = u32::from(u16::from_le_bytes([chunk[0], chunk[1]]));
-            }
-            *pos += BLOCK * 2;
-        }
-        32 => {
-            for slot in &mut dst[..BLOCK] {
-                *slot = read_u32(buf, pos);
-            }
-        }
-        _ => {
-            for chunk in dst[..BLOCK].chunks_exact_mut(32) {
-                unpack32(width, buf, pos, chunk);
-            }
-        }
-    }
-}
-
-fn pack_n(width: u32, src: &[u32], out: &mut Vec<u8>) {
-    if width == 0 || src.is_empty() {
-        return;
-    }
-    let mut i = 0;
-    while i + 32 <= src.len() {
-        pack32(width, &src[i..], out);
-        i += 32;
-    }
-    if i < src.len() {
-        let mut tmp = [0u32; 32];
-        tmp[..src.len() - i].copy_from_slice(&src[i..]);
-        let start = out.len();
-        pack32(width, &tmp, out);
-        let keep = ((src.len() - i) * width as usize).div_ceil(32) * 4;
-        out.truncate(start + keep);
-    }
-}
-
-fn unpack_n(width: u32, count: usize, buf: &[u8], pos: &mut usize) -> Vec<u32> {
-    let mut out = vec![0u32; count];
-    if width == 0 || count == 0 {
-        return out;
-    }
-    let mut i = 0;
-    while i + 32 <= count {
-        unpack32(width, buf, pos, &mut out[i..]);
-        i += 32;
-    }
-    if i < count {
-        let bytes = ((count - i) * width as usize).div_ceil(32) * 4;
-        let mut padded = [0u8; 128];
-        padded[..bytes].copy_from_slice(&buf[*pos..*pos + bytes]);
-        *pos += bytes;
-        let mut tmp = [0u32; 32];
-        let mut p = 0;
-        unpack32(width, &padded, &mut p, &mut tmp);
-        out[i..].copy_from_slice(&tmp[..count - i]);
-    }
-    out
 }
 
 /// Choose `b` minimising the paper's cost. Returns `(b, nexcept, maxbits)`.
-fn best_b(block: &[u32; 128]) -> (u8, u8, u8) {
+fn best_b(block: &[u32; BLOCK]) -> (u8, u8, u8) {
     let mut freqs = [0u32; 33];
     for &v in block {
         freqs[bits_of(v)] += 1;
@@ -209,6 +75,26 @@ fn best_b(block: &[u32; 128]) -> (u8, u8, u8) {
     (optimal_bits, exception_count, max_bits)
 }
 
+fn pack_block(width: u32, block: &mut [u32; BLOCK], out: &mut Vec<u8>) {
+    if width < 32 {
+        let m = low_mask(width);
+        for v in &mut *block {
+            *v &= m;
+        }
+    }
+    let start = out.len();
+    out.resize(start + bitpack::packed_len(width), 0);
+    bitpack::pack(width, block, &mut out[start..]);
+}
+
+fn pack_except(width: u32, src: &[u32], out: &mut Vec<u8>) {
+    let mut w = bits::Writer::new(out);
+    for &v in src {
+        w.put(u64::from(v), width);
+    }
+    w.align();
+}
+
 fn encode_page(page: &[u32], out: &mut Vec<u8>) {
     debug_assert!(!page.is_empty() && page.len().is_multiple_of(BLOCK));
 
@@ -237,7 +123,7 @@ fn encode_page(page: &[u32], out: &mut Vec<u8>) {
                 }
             }
         }
-        pack(u32::from(b), &block, out);
+        pack_block(u32::from(b), &mut block, out);
     }
 
     let packed_len = (out.len() - packed_start) as u32;
@@ -260,9 +146,13 @@ fn encode_page(page: &[u32], out: &mut Vec<u8>) {
     for (k, slot) in except.iter().enumerate().skip(2) {
         if !slot.is_empty() {
             write_u32(out, slot.len() as u32);
-            pack_n(k as u32, slot, out);
+            pack_except(k as u32, slot, out);
         }
     }
+}
+
+fn except_bytes(width: usize, count: usize) -> usize {
+    (count * width).div_ceil(8)
 }
 
 fn decode_page(n: usize, buf: &[u8], pos: &mut usize, dst: &mut [u32]) {
@@ -278,25 +168,27 @@ fn decode_page(n: usize, buf: &[u8], pos: &mut usize, dst: &mut [u32]) {
     *pos = meta_start + meta_len.next_multiple_of(4);
 
     let bitmap = read_u32(buf, pos);
-    let mut except: [Vec<u32>; 33] = std::array::from_fn(|_| Vec::new());
-    for (k, slot) in except.iter_mut().enumerate().skip(2) {
+    let mut except_at = [0usize; 33];
+    for (k, at) in except_at.iter_mut().enumerate().skip(2) {
         if bitmap & (1 << (k - 1)) != 0 {
             let count = read_u32(buf, pos) as usize;
-            *slot = unpack_n(k as u32, count, buf, pos);
+            *at = *pos * 8;
+            *pos += except_bytes(k, count);
         }
     }
+    let bits = bits::Reader::new(buf);
 
     let mut packed_pos = 0;
     let mut meta_pos = 0;
-    let mut except_i = [0usize; 33];
-    let n_blocks = n / BLOCK;
-    for b_i in 0..n_blocks {
+    let (blocks, _) = dst[..n].as_chunks_mut::<BLOCK>();
+    for dst_block in blocks {
         let width = u32::from(meta[meta_pos]);
         meta_pos += 1;
         let nexcept = usize::from(meta[meta_pos]);
         meta_pos += 1;
-        let off = b_i * BLOCK;
-        unpack(width, packed, &mut packed_pos, &mut dst[off..]);
+        let n_bytes = bitpack::packed_len(width);
+        bitpack::unpack(width, &packed[packed_pos..packed_pos + n_bytes], dst_block);
+        packed_pos += n_bytes;
         if nexcept > 0 {
             let maxb = meta[meta_pos];
             meta_pos += 1;
@@ -305,10 +197,11 @@ fn decode_page(n: usize, buf: &[u8], pos: &mut usize, dst: &mut [u32]) {
                 let idx = usize::from(meta[meta_pos]);
                 meta_pos += 1;
                 if diff == 1 {
-                    dst[off + idx] |= 1 << width;
+                    dst_block[idx] |= 1u32 << width;
                 } else {
-                    dst[off + idx] |= except[diff][except_i[diff]] << width;
-                    except_i[diff] += 1;
+                    let hi = bits.get(except_at[diff], diff as u32) as u32;
+                    except_at[diff] += diff;
+                    dst_block[idx] |= hi << width;
                 }
             }
         }
@@ -417,33 +310,24 @@ mod tests {
     }
 
     #[test]
-    fn pack32_writes_exactly_width_words() {
-        for width in 0..=32u32 {
-            let src = [0x1234_5678u32; 32];
-            let mut buf = Vec::new();
-            pack32(width, &src, &mut buf);
-            assert_eq!(buf.len(), 4 * width as usize, "width={width}");
-        }
-    }
-
-    #[test]
-    fn pack_n_roundtrip_counts() {
-        for width in 1..=32u32 {
+    fn except_arrays_roundtrip_counts() {
+        for width in 2..=32u32 {
             for count in 1..=40 {
-                let mask = if width >= 32 {
-                    u32::MAX
-                } else {
-                    (1u32 << width) - 1
-                };
+                let mask = low_mask(width);
                 let src: Vec<u32> = (0..count)
                     .map(|i| (i as u32).wrapping_mul(7) & mask)
                     .collect();
                 let mut buf = Vec::new();
-                pack_n(width, &src, &mut buf);
-                let mut pos = 0;
-                let got = unpack_n(width, count, &buf, &mut pos);
-                assert_eq!(pos, buf.len(), "width={width} count={count} leftover");
-                assert_eq!(got, src, "width={width} count={count}");
+                pack_except(width, &src, &mut buf);
+                assert_eq!(buf.len(), except_bytes(width as usize, count));
+                let r = bits::Reader::new(&buf);
+                for (i, &want) in src.iter().enumerate() {
+                    assert_eq!(
+                        r.get(i * width as usize, width) as u32,
+                        want,
+                        "width={width} count={count} i={i}"
+                    );
+                }
             }
         }
     }
@@ -458,26 +342,13 @@ mod tests {
     }
 
     #[test]
-    fn pack_unpack_widths() {
+    fn one_block_every_width() {
         for width in 0..=32 {
-            let mut src = [0u32; 128];
-            let mask = if width == 0 {
-                0
-            } else if width >= 32 {
-                u32::MAX
-            } else {
-                (1u32 << width) - 1
-            };
-            for (i, slot) in src.iter_mut().enumerate() {
-                *slot = (i as u32).wrapping_mul(0x9e37) & mask;
-            }
-            let mut buf = Vec::new();
-            pack(width, &src, &mut buf);
-            let mut dst = [0u32; 128];
-            let mut pos = 0;
-            unpack(width, &buf, &mut pos, &mut dst);
-            assert_eq!(dst, src, "width={width}");
-            assert_eq!(pos, buf.len());
+            let mask = low_mask(width);
+            let src: Vec<u32> = (0..128)
+                .map(|i| (i as u32).wrapping_mul(0x9e37) & mask)
+                .collect();
+            roundtrip_unsorted(&src);
         }
     }
 
@@ -497,13 +368,7 @@ mod tests {
             (20, 60),
             (31, 2),
         ] {
-            let mask = if width == 0 {
-                0
-            } else if width >= 32 {
-                u32::MAX
-            } else {
-                (1u32 << width) - 1
-            };
+            let mask = low_mask(width);
             let mut block = [0u32; 128];
             for slot in &mut block {
                 *slot = rng.random::<u32>() & mask;

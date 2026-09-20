@@ -12,8 +12,8 @@
 //! [`bp128`]: crate::bp128
 
 use crate::bitpack::BLOCK;
-use crate::bp128::{self, varint};
-use crate::{Cursor, delta};
+use crate::bp128;
+use crate::{Cursor, delta, vbyte};
 
 /// Bytes of skip table in front of the payload of an `n`-element list.
 pub fn aux_len(n: usize) -> usize {
@@ -150,7 +150,7 @@ pub fn get_sorted(n: usize, buf: &[u8], i: usize) -> u32 {
     let mut byte = table.tail_start();
     let mut prev = delta::carried(table.base(table.blocks));
     for _ in 0..=i % BLOCK {
-        prev = delta::value_after(prev, varint::take(buf, &mut byte));
+        prev = delta::value_after(prev, vbyte::take(buf, &mut byte));
     }
     prev
 }
@@ -168,7 +168,7 @@ pub fn get(n: usize, buf: &[u8], i: usize) -> u32 {
     let mut byte = table.tail_start();
     let mut v = 0;
     for _ in 0..=i % BLOCK {
-        v = varint::take(buf, &mut byte);
+        v = vbyte::take(buf, &mut byte);
     }
     v
 }
@@ -252,7 +252,7 @@ impl<'a> SortedCursor<'a> {
         let mut pos = self.pos;
         let mut hit = false;
         while pos < self.n {
-            prev = delta::value_after(prev, varint::take(self.buf, &mut byte));
+            prev = delta::value_after(prev, vbyte::take(self.buf, &mut byte));
             pos += 1;
             if prev >= target {
                 hit = true;
@@ -308,7 +308,7 @@ impl Cursor for SortedCursor<'_> {
                 self.enter_tail();
             }
             let mut byte = self.tail.unwrap_or_default();
-            let v = delta::value(self.cur, varint::take(self.buf, &mut byte));
+            let v = delta::value(self.cur, vbyte::take(self.buf, &mut byte));
             self.tail = Some(byte);
             v
         };

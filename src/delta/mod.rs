@@ -3,6 +3,12 @@
 //! increasing list guarantees is non-negative and saves one bit per gap on
 //! dense lists.
 
+/// Four-lane SSE2 form of [`value`]: in-vector prefix sum of `gap + 1` plus
+/// the previous group's last lane. The bitpack and Stream VByte kernels
+/// share it.
+#[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+pub(crate) mod simd;
+
 /// Delta-code `list` (strictly increasing) into `out`. `base` is the value
 /// the first element is relative to, `None` for the head of a list.
 pub fn encode(base: Option<u32>, list: &[u32], out: &mut Vec<u32>) {
