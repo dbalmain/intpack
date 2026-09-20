@@ -17,14 +17,14 @@
 //! [types][packed offsets]                   2-bit directory + offset directory
 //! [payload]                                 per partition: all-ones = nothing;
 //!                                           bitmap = bitmap; EF = [lows][highs]
-//! [upper select samples]                    select positions, one u32 per 256 partitions
+//! [upper select samples]                    the long-list select-one index
 //! ```
 //!
 //! `n` and `universe` are stored out of band by the caller. Empty lists
 //! encode to an empty buffer.
 
 use crate::bits::{Reader, Writer};
-use crate::elias_fano::{self, Layout as EfLayout, SELECT_Q};
+use crate::elias_fano::{self, Layout as EfLayout, SampleIndex};
 
 const PARTITION_SIZE: usize = 128;
 const TYPE_ALL_ONES: u8 = 0;
@@ -92,17 +92,10 @@ pub fn encode(universe: u32, list: &[u32], out: &mut Vec<u8>) {
     }
     writer.align();
     out.extend_from_slice(&payload);
-    for (i, &b) in upper_bounds.iter().enumerate().step_by(SELECT_Q) {
-        let pos = (u64::from(b) >> upper_l) as usize + i;
-        out.extend_from_slice(&(pos as u32).to_le_bytes());
+    let upper_highs_bits = partition_count + (u64::from(universe) >> upper_l) as usize;
+    if elias_fano::has_samples(upper_highs_bits) {
+        elias_fano::encode_select1(&upper_bounds, upper_l, out);
     }
-    // Trailing marker so `aux_bytes` can report the index overhead without
-    // needing `universe`.
-    let aux = 2
-        + partition_count.div_ceil(4)
-        + (partition_count * u32::from(offset_width) as usize).div_ceil(8)
-        + partition_count.div_ceil(SELECT_Q) * 4;
-    out.extend_from_slice(&(aux as u32).to_le_bytes());
 }
 
 /// Reconstruct exactly the `n` values `encode` produced, appending to `out`.
@@ -136,25 +129,27 @@ pub fn decode(universe: u32, n: usize, buf: &[u8], out: &mut Vec<u32>) {
     }
 }
 
-/// Bytes the select samples and the directory occupy; the offset directory
-/// width is not knowable without the buffer, so this under-reports by it.
-/// Callers that hold the buffer should use [`aux_bytes`].
-pub fn aux_len(_universe: u32, n: usize) -> usize {
+/// Bytes the header, type directory, and upper select samples occupy. The
+/// packed offset directory is excluded because its width is stored in the
+/// encoded buffer; callers with the buffer should use [`aux_bytes`].
+pub fn aux_len(universe: u32, n: usize) -> usize {
     if n == 0 {
         return 0;
     }
     let partition_count = n.div_ceil(PARTITION_SIZE);
-    2 + partition_count.div_ceil(4) + partition_count.div_ceil(SELECT_Q) * 4
+    let upper_l = elias_fano::low_width(universe, partition_count);
+    let highs_bits = partition_count + (u64::from(universe) >> upper_l) as usize;
+    2 + partition_count.div_ceil(4) + elias_fano::select1_len(partition_count, highs_bits)
 }
 
 /// Full index overhead from an encoded buffer: header + type directory +
 /// offset directory + upper select samples.
-pub fn aux_bytes(n: usize, buf: &[u8]) -> usize {
+pub fn aux_bytes(universe: u32, n: usize, buf: &[u8]) -> usize {
     if n == 0 {
         return 0;
     }
-    let b = &buf[buf.len() - 4..];
-    u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize
+    let partition_count = n.div_ceil(PARTITION_SIZE);
+    aux_len(universe, n) + (partition_count * usize::from(buf[1])).div_ceil(8)
 }
 
 /// The `i`-th value by ordinal.
@@ -303,8 +298,12 @@ impl<'a> Layout<'a> {
         let offsets_start = types_start + partition_count.div_ceil(4);
         let offsets_bytes = (partition_count * offset_width as usize).div_ceil(8);
         let payload_start = offsets_start + offsets_bytes;
-        let select1_bytes = partition_count.div_ceil(SELECT_Q) * 4;
-        let samples_start = buf.len() - 4 - select1_bytes;
+        let select1_bytes = elias_fano::select1_len(partition_count, upper_highs_bits);
+        let samples_start = if select1_bytes == 0 {
+            0
+        } else {
+            buf.len() - select1_bytes
+        };
         Self {
             buf,
             n,
@@ -328,10 +327,16 @@ impl<'a> Layout<'a> {
             self.universe,
             self.buf,
             self.upper_lows_bit,
-            crate::elias_fano::SampleIndex {
-                select1: self.samples_start,
-                select0_super: 0,
-                select0_sub: 0,
+            if self.samples_start == 0 {
+                SampleIndex::default()
+            } else {
+                SampleIndex {
+                    select1_super: self.samples_start,
+                    select1_sub: self.samples_start
+                        + self.partition_count.div_ceil(elias_fano::SELECT1_SUPER) * 4,
+                    select0_super: 0,
+                    select0_sub: 0,
+                }
             },
         )
     }
@@ -724,6 +729,11 @@ mod tests {
 
     #[test]
     fn size_sanity() {
+        let short: Vec<u32> = (0..11).collect();
+        let encoded = enc(&short, 1 << 20);
+        assert_eq!(encoded.len(), 7);
+        assert_eq!(aux_bytes(1 << 20, short.len(), &encoded), 3);
+
         let every_second: Vec<u32> = (0..100_000).step_by(2).collect();
         let encoded = enc(&every_second, 100_000);
         let bits_per_int = encoded.len() as f64 * 8.0 / every_second.len() as f64;
