@@ -141,7 +141,9 @@ impl Cursor for SortedCursor<'_> {
             return None;
         }
         self.remaining -= 1;
-        let gap = take_fast(self.buf, &mut self.pos);
+        // Not `take_fast`: on a one-element-at-a-time path its extra branch
+        // costs more than it saves (cursor seek measured 1.6× slower with it).
+        let gap = take(self.buf, &mut self.pos);
         let v = match self.current {
             Some(prev) => prev + gap + 1,
             None => gap,
