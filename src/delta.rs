@@ -41,6 +41,20 @@ pub fn value(prev: Option<u32>, gap: u32) -> u32 {
     }
 }
 
+/// `prev` for a loop that carries it as a plain `u32`: `u32::MAX` stands for
+/// `None`, since `MAX + gap + 1` wraps to `gap`, which is the head-of-list
+/// rule of [`value`] without a branch. Pair with [`value_after`].
+#[inline]
+pub fn carried(prev: Option<u32>) -> u32 {
+    prev.unwrap_or(u32::MAX)
+}
+
+/// [`value`] on a [`carried`] `prev`.
+#[inline]
+pub fn value_after(prev: u32, gap: u32) -> u32 {
+    prev.wrapping_add(gap).wrapping_add(1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -62,5 +76,18 @@ mod tests {
         assert_eq!(coded, [0, 1]);
         decode(Some(9), &mut coded);
         assert_eq!(coded, [10, 12]);
+    }
+
+    #[test]
+    fn carried_form_matches_value() {
+        for prev in [None, Some(0), Some(9), Some(u32::MAX - 1001)] {
+            for gap in [0, 1, 1000] {
+                assert_eq!(
+                    value_after(carried(prev), gap),
+                    value(prev, gap),
+                    "{prev:?} + {gap}"
+                );
+            }
+        }
     }
 }

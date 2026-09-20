@@ -39,7 +39,10 @@
 //! | [`elias_fano`] | EF with sampled select | ✓ | — | ✓ | ✓ |
 //! | [`pef`] | partitioned EF | ✓ | — | ✓ | ✓ |
 
+pub mod bitpack;
 pub mod bits;
+pub mod bp128;
+pub mod bp128skip;
 pub mod cursor;
 pub mod delta;
 
