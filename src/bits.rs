@@ -115,15 +115,56 @@ impl<'a> Reader<'a> {
     fn load(&self, byte: usize) -> u64 {
         match self.buf.get(byte..byte + 8) {
             Some(bytes) => u64::from_le_bytes(bytes.try_into().unwrap_or([0; 8])),
-            None => {
-                let mut bytes = [0u8; 8];
-                if let Some(tail) = self.buf.get(byte..) {
-                    bytes[..tail.len()].copy_from_slice(tail);
-                }
-                u64::from_le_bytes(bytes)
-            }
+            None => self.buf.get(byte..).map_or(0, tail_word),
         }
     }
+}
+
+#[inline]
+fn tail_word(bytes: &[u8]) -> u64 {
+    match bytes {
+        [] => 0,
+        &[a] => u64::from_le_bytes([a, 0, 0, 0, 0, 0, 0, 0]),
+        &[a, b] => u64::from_le_bytes([a, b, 0, 0, 0, 0, 0, 0]),
+        &[a, b, c] => u64::from_le_bytes([a, b, c, 0, 0, 0, 0, 0]),
+        &[a, b, c, d] => u64::from_le_bytes([a, b, c, d, 0, 0, 0, 0]),
+        &[a, b, c, d, e] => u64::from_le_bytes([a, b, c, d, e, 0, 0, 0]),
+        &[a, b, c, d, e, f] => u64::from_le_bytes([a, b, c, d, e, f, 0, 0]),
+        &[a, b, c, d, e, f, g] => u64::from_le_bytes([a, b, c, d, e, f, g, 0]),
+        _ => unreachable!("tail_word receives fewer than eight bytes"),
+    }
+}
+
+/// Bit position of the `rank`-th one in `word` (zero-indexed).
+///
+/// The portable kernel narrows by popcount halves; BMI2 maps it to `pdep`.
+#[inline]
+#[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+pub(crate) fn select_one(mut word: u64, mut rank: usize) -> u32 {
+    debug_assert!(rank < word.count_ones() as usize);
+    let mut offset = 0;
+    for width in [32, 16, 8, 4, 2, 1] {
+        let mask = (1u64 << width) - 1;
+        let lower = word & mask;
+        let ones = lower.count_ones() as usize;
+        if rank < ones {
+            word = lower;
+        } else {
+            rank -= ones;
+            word >>= width;
+            offset += width;
+        }
+    }
+    offset
+}
+
+#[inline]
+#[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+pub(crate) fn select_one(word: u64, rank: usize) -> u32 {
+    use core::arch::x86_64::_pdep_u64;
+
+    // SAFETY: this implementation is compiled only when BMI2 is enabled.
+    unsafe { _pdep_u64(1 << rank, word) }.trailing_zeros()
 }
 
 #[cfg(test)]
@@ -182,5 +223,14 @@ mod tests {
         let r = Reader::new(&[0xff, 0xff]);
         assert_eq!(r.get(8, 16), 0xff);
         assert_eq!(r.word(16), 0);
+    }
+
+    #[test]
+    fn selects_each_one() {
+        let word = 0x8100_0400_0000_1021;
+        let positions: Vec<u32> = (0..64).filter(|&bit| word >> bit & 1 == 1).collect();
+        for (rank, position) in positions.into_iter().enumerate() {
+            assert_eq!(select_one(word, rank), position);
+        }
     }
 }
