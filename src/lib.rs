@@ -42,5 +42,8 @@
 pub mod bits;
 pub mod cursor;
 pub mod delta;
+pub mod fastpfor;
+pub mod streamvbyte;
+pub mod vbyte;
 
 pub use cursor::Cursor;
