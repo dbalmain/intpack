@@ -234,8 +234,9 @@ impl<'a> Layout<'a> {
 
     /// Scan forward from rank `index` (the one at bit `pos`) for the first
     /// element with value `>= target`, returning `(index, pos, value)`.
-    /// The scan stops at the first element whose high exceeds the target's,
-    /// since that value is already past the target.
+    /// A whole 64-bit word whose last element still has a high part below the
+    /// target's is skipped in one popcount; only the word containing the
+    /// answer is walked element by element.
     pub(crate) fn scan(
         &self,
         mut index: usize,
@@ -245,9 +246,25 @@ impl<'a> Layout<'a> {
         let target_high = (u64::from(target) >> self.l) as usize;
         let target_low = (u64::from(target) & ((1u64 << self.l) - 1)) as u32;
         let mut word_index = pos / 64;
-        let mut word = self.word_at_rel(word_index) & (u64::MAX << (pos % 64));
+        let mut word = self.word_at_rel(word_index) & mask_above(pos % 64);
         loop {
-            if word != 0 {
+            if word == 0 {
+                word_index += 1;
+                word = self.word_at_rel(word_index);
+                continue;
+            }
+            let ones = word.count_ones() as usize;
+            let last_pos = word_index * 64 + (63 - word.leading_zeros()) as usize;
+            if last_pos - (index + ones - 1) < target_high {
+                index += ones;
+                if index >= self.n {
+                    return None;
+                }
+                word_index += 1;
+                word = self.word_at_rel(word_index);
+                continue;
+            }
+            loop {
                 let one_pos = word_index * 64 + word.trailing_zeros() as usize;
                 let high = one_pos - index;
                 if high > target_high {
@@ -268,13 +285,11 @@ impl<'a> Layout<'a> {
                 }
                 word &= word - 1;
                 if word == 0 {
-                    word_index += 1;
-                    word = self.word_at_rel(word_index);
+                    break;
                 }
-            } else {
-                word_index += 1;
-                word = self.word_at_rel(word_index);
             }
+            word_index += 1;
+            word = self.word_at_rel(word_index);
         }
     }
 
