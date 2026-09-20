@@ -115,14 +115,23 @@ impl<'a> Reader<'a> {
     fn load(&self, byte: usize) -> u64 {
         match self.buf.get(byte..byte + 8) {
             Some(bytes) => u64::from_le_bytes(bytes.try_into().unwrap_or([0; 8])),
-            None => {
-                let mut bytes = [0u8; 8];
-                if let Some(tail) = self.buf.get(byte..) {
-                    bytes[..tail.len()].copy_from_slice(tail);
-                }
-                u64::from_le_bytes(bytes)
-            }
+            None => self.buf.get(byte..).map_or(0, tail_word),
         }
+    }
+}
+
+#[inline]
+fn tail_word(bytes: &[u8]) -> u64 {
+    match bytes {
+        [] => 0,
+        &[a] => u64::from_le_bytes([a, 0, 0, 0, 0, 0, 0, 0]),
+        &[a, b] => u64::from_le_bytes([a, b, 0, 0, 0, 0, 0, 0]),
+        &[a, b, c] => u64::from_le_bytes([a, b, c, 0, 0, 0, 0, 0]),
+        &[a, b, c, d] => u64::from_le_bytes([a, b, c, d, 0, 0, 0, 0]),
+        &[a, b, c, d, e] => u64::from_le_bytes([a, b, c, d, e, 0, 0, 0]),
+        &[a, b, c, d, e, f] => u64::from_le_bytes([a, b, c, d, e, f, 0, 0]),
+        &[a, b, c, d, e, f, g] => u64::from_le_bytes([a, b, c, d, e, f, g, 0]),
+        _ => unreachable!("tail_word receives fewer than eight bytes"),
     }
 }
 

@@ -26,6 +26,9 @@
 
 use crate::bits::{self, Reader, Writer};
 
+mod view;
+pub use view::View;
+
 pub(crate) const SELECT1_SUPER: usize = 1024;
 const SELECT1_SUB: usize = 64;
 pub(crate) const SAMPLE_THRESHOLD_WORDS: usize = 16;
@@ -200,24 +203,6 @@ pub fn get(universe: u32, n: usize, buf: &[u8], i: usize) -> u32 {
     View::new(universe, n, buf).get(i)
 }
 
-/// A zero-copy list opened once for repeated queries.
-pub struct View<'a>(Layout<'a>);
-
-impl<'a> View<'a> {
-    pub fn new(universe: u32, n: usize, buf: &'a [u8]) -> Self {
-        Self(Layout::with_samples(universe, n, buf))
-    }
-
-    pub fn get(&self, i: usize) -> u32 {
-        assert!(i < self.0.n, "elias_fano::get({i}) out of range");
-        self.0.value_at(i, self.0.select_one(i))
-    }
-
-    pub fn cursor(&self) -> Cursor<'a> {
-        Cursor::from_layout(self.0)
-    }
-}
-
 /// Byte offsets of the select sample structures within a buffer.
 #[derive(Default)]
 pub(crate) struct SampleIndex {
@@ -303,22 +288,13 @@ impl<'a> Layout<'a> {
     /// Position of the one for the `i`-th element (its rank), jumping via the
     /// samples when present and scanning at most [`SELECT1_SUB`] ones.
     pub(crate) fn select_one(&self, i: usize) -> usize {
-        let (start, mut rest) = if self.sample_count > 0 {
-            self.select1_start(i)
-        } else {
-            (0, i + 1)
-        };
-        let mut word_index = start / 64;
-        let mut word = self.word_at_rel(word_index) & (u64::MAX << (start % 64));
-        loop {
-            let ones = word.count_ones() as usize;
-            if rest <= ones {
-                return word_index * 64 + bits::select_one(word, rest - 1) as usize;
-            }
-            rest -= ones;
-            word_index += 1;
-            word = self.word_at_rel(word_index);
-        }
+        select_one(
+            self.buf,
+            self.highs_bit,
+            self.s1_super_start,
+            self.s1_sub_start,
+            i,
+        )
     }
 
     /// Value at rank `i`, whose one is at `pos` relative to the highs.
@@ -479,27 +455,8 @@ impl<'a> Layout<'a> {
         }
     }
 
-    fn select1_start(&self, i: usize) -> (usize, usize) {
-        let super_index = i / SELECT1_SUPER;
-        let base = self.super_position(super_index);
-        let sub_index = i / SELECT1_SUB;
-        let b = self.s1_sub_start + sub_index * 2;
-        let offset = usize::from(u16::from_le_bytes([self.buf[b], self.buf[b + 1]]));
-        if offset == usize::from(u16::MAX) {
-            (base, i - super_index * SELECT1_SUPER + 1)
-        } else {
-            (base + offset, i % SELECT1_SUB + 1)
-        }
-    }
-
     fn super_position(&self, k: usize) -> usize {
-        let b = self.s1_super_start + k * 4;
-        u32::from_le_bytes([
-            self.buf[b],
-            self.buf[b + 1],
-            self.buf[b + 2],
-            self.buf[b + 3],
-        ]) as usize
+        read_u32(self.buf, self.s1_super_start + k * 4) as usize
     }
 
     /// The highs word `word_index` (positions relative to the highs start),
@@ -511,6 +468,43 @@ impl<'a> Layout<'a> {
         }
         word
     }
+}
+
+fn select_one(
+    buf: &[u8],
+    highs_bit: usize,
+    super_start: usize,
+    sub_start: usize,
+    i: usize,
+) -> usize {
+    let (start, mut rest) = if super_start > 0 {
+        let super_index = i / SELECT1_SUPER;
+        let base = read_u32(buf, super_start + super_index * 4) as usize;
+        let b = sub_start + i / SELECT1_SUB * 2;
+        let offset = usize::from(u16::from_le_bytes([buf[b], buf[b + 1]]));
+        if offset == usize::from(u16::MAX) {
+            (base, i - super_index * SELECT1_SUPER + 1)
+        } else {
+            (base + offset, i % SELECT1_SUB + 1)
+        }
+    } else {
+        (0, i + 1)
+    };
+    let mut word_index = start / 64;
+    let mut word = word_at(buf, highs_bit + word_index * 64) & mask_above(start % 64);
+    loop {
+        let ones = word.count_ones() as usize;
+        if rest <= ones {
+            return word_index * 64 + bits::select_one(word, rest - 1) as usize;
+        }
+        rest -= ones;
+        word_index += 1;
+        word = word_at(buf, highs_bit + word_index * 64);
+    }
+}
+
+fn read_u32(buf: &[u8], at: usize) -> u32 {
+    u32::from_le_bytes([buf[at], buf[at + 1], buf[at + 2], buf[at + 3]])
 }
 
 /// The 64-bit word starting at bit `pos`, zero-padded past the buffer end.
