@@ -45,7 +45,9 @@ pub mod bp128;
 pub mod bp128skip;
 pub mod cursor;
 pub mod delta;
+pub mod elias_fano;
 pub mod fastpfor;
+pub mod pef;
 pub mod streamvbyte;
 pub mod vbyte;
 
