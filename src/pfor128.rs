@@ -40,49 +40,20 @@ const fn bits_required(value: u32) -> u32 {
 
 /// Lucene's fixed exception rule: the eighth-largest value sets the floor,
 /// and an exception high part may occupy at most one byte.
-fn patched_width(block: &[u32; BLOCK]) -> u32 {
-    let (eighth, max_bits) = eighth_largest(block);
-    bits_required(eighth).max(max_bits.saturating_sub(8))
-}
-
-/// Eighth-largest value and the bits of the largest. `top` stays ascending,
-/// so `top[0]` is the smallest of the eight largest — the value a full sort
-/// would leave at `BLOCK - 8`, without copying the block.
-fn eighth_largest(block: &[u32; BLOCK]) -> (u32, u32) {
-    let mut top = [0u32; MAX_EXCEPTIONS + 1];
-    let mut acc = 0u32;
-    for &v in block {
-        observe(&mut top, &mut acc, v);
-    }
-    (top[0], 32 - acc.leading_zeros())
-}
-
-#[inline]
-fn observe(top: &mut [u32; MAX_EXCEPTIONS + 1], acc: &mut u32, v: u32) {
-    *acc |= v;
-    if v > top[0] {
-        insert_eighth(top, v);
-    }
-}
-
-/// `top` is ascending and `v > top[0]`, which `v` displaces.
-#[inline]
-fn insert_eighth(top: &mut [u32; MAX_EXCEPTIONS + 1], v: u32) {
-    let mut i = 0;
-    while i < MAX_EXCEPTIONS && top[i + 1] < v {
-        top[i] = top[i + 1];
-        i += 1;
-    }
-    top[i] = v;
+fn patched_width(block: &[u32; BLOCK]) -> (u32, usize) {
+    let max_bits = bitpack::width(block);
+    let mut copy = *block;
+    // Eighth-largest: the element at `BLOCK - 8` once the copy is partitioned.
+    let (_, eighth, _) = copy.select_nth_unstable(BLOCK - 8);
+    let width = bits_required(*eighth).max(max_bits.saturating_sub(8));
+    let mask = low_mask(width);
+    let exceptions = block.iter().filter(|&&v| v > mask).count();
+    debug_assert!(exceptions <= MAX_EXCEPTIONS);
+    (width, exceptions)
 }
 
 fn encode_values(block: &[u32; BLOCK], out: &mut Vec<u8>) {
-    encode_known(block, patched_width(block), out);
-}
-
-fn encode_known(block: &[u32; BLOCK], width: u32, out: &mut Vec<u8>) {
-    let mask = low_mask(width);
-    let exceptions = block.iter().filter(|&&v| v > mask).count();
+    let (width, exceptions) = patched_width(block);
     if width == 32 || (width == 31 && exceptions == MAX_EXCEPTIONS) {
         out.push(RAW_TOKEN);
         for &v in block {
@@ -90,10 +61,10 @@ fn encode_known(block: &[u32; BLOCK], width: u32, out: &mut Vec<u8>) {
         }
         return;
     }
-    debug_assert!(exceptions <= MAX_EXCEPTIONS);
 
     out.push(((exceptions as u8) << 5) | width as u8);
     let mut lows = *block;
+    let mask = low_mask(width);
     for (i, v) in lows.iter_mut().enumerate() {
         if *v > mask {
             out.extend_from_slice(&[i as u8, (*v >> width) as u8]);
@@ -114,17 +85,12 @@ pub(crate) fn encode_block_sorted(
     out: &mut Vec<u8>,
 ) -> u32 {
     let mut gaps = [0; BLOCK];
-    let mut top = [0u32; MAX_EXCEPTIONS + 1];
-    let mut acc = 0u32;
     let mut prev = base;
     for (&v, gap) in block.iter().zip(&mut gaps) {
-        let g = delta::gap(prev, v);
+        *gap = delta::gap(prev, v);
         prev = Some(v);
-        *gap = g;
-        observe(&mut top, &mut acc, g);
     }
-    let width = bits_required(top[0]).max((32 - acc.leading_zeros()).saturating_sub(8));
-    encode_known(&gaps, width, out);
+    encode_values(&gaps, out);
     block[BLOCK - 1]
 }
 
@@ -153,11 +119,9 @@ pub(crate) fn decode_block_sorted(
             bitpack::unpack_sorted(width, base, packed, out);
         } else {
             let (patches, packed) = take_patched(buf, byte);
-            // The packed lows decode straight into values. An exception
-            // adds `high << width` to one gap, which shifts every value
-            // from that index on by the same amount.
-            bitpack::unpack_sorted(width, base, packed, out);
-            correct::apply(width, patches, out);
+            bitpack::unpack(width, packed, out);
+            apply_exceptions(width, patches, out);
+            delta::decode(base, out);
         }
     }
     out[BLOCK - 1]
@@ -191,116 +155,6 @@ fn take_patched<'a>(buf: &'a [u8], byte: &mut usize) -> (&'a [u8], &'a [u8]) {
 fn apply_exceptions(width: u32, patches: &[u8], out: &mut [u32; BLOCK]) {
     for pair in patches.as_chunks::<2>().0 {
         out[usize::from(pair[0])] |= u32::from(pair[1]) << width;
-    }
-}
-
-/// Running correction after a sorted unpack of the packed lows.
-///
-/// [`scalar`] is the specification. [`simd`] adds the same running total
-/// four lanes at a time; a group that contains an exception index stays
-/// scalar, because the total changes inside it.
-mod correct {
-    use super::BLOCK;
-
-    /// Compiled when it is the implementation or the test oracle.
-    #[cfg(any(test, not(all(target_arch = "x86_64", target_feature = "sse2"))))]
-    pub(super) mod scalar {
-        use super::BLOCK;
-
-        pub(crate) fn apply(width: u32, patches: &[u8], out: &mut [u32; BLOCK]) {
-            let pairs = patches.as_chunks::<2>().0;
-            let mut pair = 0;
-            let mut acc = 0u32;
-            for (j, value) in out.iter_mut().enumerate() {
-                if pair < pairs.len() && usize::from(pairs[pair][0]) == j {
-                    acc = acc.wrapping_add(u32::from(pairs[pair][1]) << width);
-                    pair += 1;
-                }
-                *value = value.wrapping_add(acc);
-            }
-        }
-    }
-
-    #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
-    mod simd {
-        use core::arch::x86_64::{
-            _mm_add_epi32, _mm_loadu_si128, _mm_set1_epi32, _mm_storeu_si128,
-        };
-
-        use super::BLOCK;
-
-        #[target_feature(enable = "sse2")]
-        pub(super) fn apply(width: u32, patches: &[u8], out: &mut [u32; BLOCK]) {
-            let pairs = patches.as_chunks::<2>().0;
-            let mut pair = 0;
-            let mut acc = 0u32;
-            for (g, group) in out.as_chunks_mut::<4>().0.iter_mut().enumerate() {
-                let start = g * 4;
-                if pair < pairs.len() && usize::from(pairs[pair][0]) < start + 4 {
-                    for (lane, value) in group.iter_mut().enumerate() {
-                        let j = start + lane;
-                        if pair < pairs.len() && usize::from(pairs[pair][0]) == j {
-                            acc = acc.wrapping_add(u32::from(pairs[pair][1]) << width);
-                            pair += 1;
-                        }
-                        *value = value.wrapping_add(acc);
-                    }
-                } else if acc != 0 {
-                    let p = group.as_mut_ptr().cast();
-                    // SAFETY: `group` is four `u32`s, one SSE2 vector.
-                    unsafe {
-                        let v = _mm_loadu_si128(p);
-                        _mm_storeu_si128(p, _mm_add_epi32(v, _mm_set1_epi32(acc as i32)));
-                    }
-                }
-            }
-        }
-    }
-
-    pub(super) fn apply(width: u32, patches: &[u8], out: &mut [u32; BLOCK]) {
-        debug_assert!(width < 32, "patched width {width}");
-        debug_assert!(patches.len().is_multiple_of(2));
-        debug_assert!(patches.as_chunks::<2>().0.is_sorted_by_key(|pair| pair[0]));
-        #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
-        // SAFETY: this branch is compiled only when SSE2 is enabled.
-        unsafe {
-            simd::apply(width, patches, out);
-        }
-        #[cfg(not(all(target_arch = "x86_64", target_feature = "sse2")))]
-        scalar::apply(width, patches, out);
-    }
-
-    #[cfg(all(test, target_arch = "x86_64", target_feature = "sse2"))]
-    #[test]
-    fn simd_matches_scalar() {
-        use rand::prelude::*;
-
-        let mut rng = StdRng::seed_from_u64(11);
-        for width in 0..32 {
-            let high_bits = (32 - width).min(8);
-            let high_max = if high_bits == 0 {
-                0
-            } else {
-                (1u32 << high_bits) - 1
-            };
-            for _ in 0..4 {
-                let mut scalar_out = std::array::from_fn(|_| rng.random::<u32>());
-                let mut simd_out = scalar_out;
-                let n = rng.random_range(1..=7);
-                let mut indexes: Vec<u8> = (0..BLOCK as u8).collect();
-                indexes.shuffle(&mut rng);
-                indexes.truncate(n);
-                indexes.sort_unstable();
-                let mut patches = Vec::with_capacity(n * 2);
-                for index in indexes {
-                    let high = rng.random_range(0..=high_max) as u8;
-                    patches.extend_from_slice(&[index, high]);
-                }
-                scalar::apply(width, &patches, &mut scalar_out);
-                apply(width, &patches, &mut simd_out);
-                assert_eq!(simd_out, scalar_out, "width {width}, patches {patches:?}");
-            }
-        }
     }
 }
 
@@ -710,49 +564,6 @@ pub(crate) mod tests {
         }
     }
 
-    /// Indices 65 and 66 share a four-lane group and 127 is the last lane,
-    /// with a delta base. A correction that splats once per group, or that
-    /// drops the running total inside the group, decodes 66 and everything
-    /// after it wrong.
-    #[test]
-    fn exceptions_sharing_a_lane_group_match_scalar() {
-        let width = 9;
-        let low = low_mask(width);
-        let mut gaps = [low; BLOCK];
-        gaps[65] = low | (3 << width);
-        gaps[66] = low | (5 << width);
-        gaps[127] = low | (9 << width);
-        let head: Vec<u32> = (0..BLOCK).map(|i| i as u32).collect();
-        let base = head[BLOCK - 1];
-        let mut values = gaps;
-        delta::decode(Some(base), &mut values);
-        let mut list = head;
-        list.extend_from_slice(&values);
-
-        let mut buf = Vec::new();
-        encode_sorted(&list, &mut buf);
-        let mut back = Vec::new();
-        decode_sorted(list.len(), &buf, &mut back);
-        assert_eq!(back, list);
-
-        let mut byte = 0;
-        let mut block = [0; BLOCK];
-        let last = decode_block_sorted(None, &buf, &mut byte, &mut block);
-        assert_eq!(last, base);
-        let start = byte;
-        let mut decoded = [0; BLOCK];
-        decode_block_sorted(Some(base), &buf, &mut byte, &mut decoded);
-        assert_eq!(decoded, values);
-
-        let mut byte = start;
-        let (patches, packed) = take_patched(&buf, &mut byte);
-        assert_eq!(patches, &[65, 3, 66, 5, 127, 9]);
-        let mut reference = [0; BLOCK];
-        bitpack::unpack_sorted(width, Some(base), packed, &mut reference);
-        correct::scalar::apply(width, patches, &mut reference);
-        assert_eq!(decoded, reference);
-    }
-
     #[test]
     fn cursor_lands_on_a_patched_element() {
         let mut gaps = [0; BLOCK];
@@ -763,19 +574,6 @@ pub(crate) mod tests {
         let mut cursor = SortedCursor::new(list.len(), &buf);
         assert_eq!(cursor.next_geq(list[63] + 1), Some(list[64]));
         assert_eq!(cursor.next_geq(list[64]), Some(list[64]));
-    }
-
-    #[test]
-    fn eighth_largest_matches_a_full_sort() {
-        let mut rng = StdRng::seed_from_u64(12);
-        for _ in 0..40 {
-            let block = std::array::from_fn(|_| rng.random::<u32>());
-            let (eighth, max_bits) = eighth_largest(&block);
-            let mut ordered = block;
-            ordered.sort_unstable();
-            assert_eq!(eighth, ordered[BLOCK - 8]);
-            assert_eq!(max_bits, bitpack::width(&block));
-        }
     }
 
     #[test]
