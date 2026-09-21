@@ -5,7 +5,7 @@
 //! arrays, themselves bit-packed with [`bits`]. A `VariableByte` tail covers
 //! `n % 128`.
 //!
-//! Unlike [`bp128`](crate::bp128)'s at-most-seven inline byte patches,
+//! Unlike [`pfor128`](crate::pfor128)'s at-most-seven inline byte patches,
 //! FastPFor chooses exception counts by a cost model and collects high parts
 //! across a page. The on-disk layout is ours; the cost model matches the
 //! paper / the `fastpfor` crate, so density comes out the same. The 128-int

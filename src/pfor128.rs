@@ -1,10 +1,12 @@
-//! Bitpacked 128-blocks with a varint tail — the Lucene/Tantivy posting-list
-//! shape, and the container over the [`bitpack`] primitive.
+//! Patched bitpacked 128-blocks — Lucene's at most seven inline exceptions —
+//! with a varint tail, and the container over the [`bitpack`] primitive.
 //!
 //! Layout: every full block of 128 values starts with a token
 //! `(exceptions << 5) | width`, then up to seven `[index: u8][high: u8]`
-//! exception pairs, then `bitpack::packed_len(width)` packed low bits. Token
-//! `0xff` escapes to 128 raw little-endian `u32`s. The `n % 128` values after
+//! exception pairs, then `bitpack::packed_len(width)` packed low bits. A
+//! block with no exceptions is byte-identical to the `bitpacking` crate's
+//! `BitPacker4x` block with a width byte in front. Token `0xff` escapes to
+//! 128 raw little-endian `u32`s. The `n % 128` values after
 //! the last full block are LEB128 varints. Sorted lists store gaps per [`delta`]:
 //! the first block's first value as-is, each later value `gap - 1` from the
 //! one before it, across block boundaries, so a block's delta base is the
@@ -12,13 +14,13 @@
 //! Unsorted lists store values as-is. `n` is the caller's to keep.
 //!
 //! No skip data: the cursor decodes blocks in order and scans, so a seek to
-//! the far end of a list unpacks everything before it. [`bp128skip`] adds a
+//! the far end of a list unpacks everything before it. [`pfor128skip`] adds a
 //! table in front of this exact payload and reuses the `pub(crate)` block and
 //! tail helpers here.
 //!
 //! [`bitpack`]: crate::bitpack
 //! [`delta`]: crate::delta
-//! [`bp128skip`]: crate::bp128skip
+//! [`pfor128skip`]: crate::pfor128skip
 
 use crate::bitpack::{self, BLOCK};
 use crate::{Cursor, delta, vbyte};

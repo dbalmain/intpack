@@ -1,5 +1,5 @@
 //! Bitpacking of one 128-`u32` block at a fixed bit width — the primitive
-//! under [`bp128`](crate::bp128) and the crate's worked example of the
+//! under [`pfor128`](crate::pfor128) and the crate's worked example of the
 //! kernel rule: [`scalar`] is the specification, written in the plainest
 //! form; [`simd`] does the same work four lanes at a time and must produce
 //! identical bytes (the tests here hold it to that for every width). The

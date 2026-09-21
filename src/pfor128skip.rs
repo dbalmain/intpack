@@ -1,18 +1,18 @@
-//! [`bp128`] with a skip table in front: one `(last_value, byte_offset)`
+//! [`pfor128`] with a skip table in front: one `(last_value, byte_offset)`
 //! entry per full block lets a cursor binary-search for the block holding a
 //! target and unpack only that one, and lets `get` unpack one block by
-//! ordinal. The payload after the table is byte-identical to `bp128`.
+//! ordinal. The payload after the table is byte-identical to `pfor128`.
 //!
 //! Layout, little-endian: `n / 128` entries of `last_value: u32` (the block's
 //! final element, which is the next block's delta base; `0` for unsorted
 //! lists) then `byte_offset: u32` (the block's token byte, relative to the
-//! payload start); then the `bp128` payload. The table's length follows from
-//! `n`, so a list shorter than one block is byte-identical to `bp128`.
+//! payload start); then the `pfor128` payload. The table's length follows from
+//! `n`, so a list shorter than one block is byte-identical to `pfor128`.
 //!
-//! [`bp128`]: crate::bp128
+//! [`pfor128`]: crate::pfor128
 
 use crate::bitpack::BLOCK;
-use crate::bp128;
+use crate::pfor128;
 use crate::{Cursor, delta, vbyte};
 
 /// Bytes of skip table in front of the payload of an `n`-element list.
@@ -56,7 +56,7 @@ impl<'a> Table<'a> {
     /// Where the tail starts in `buf`: just past the last block.
     fn tail_start(&self) -> usize {
         match self.blocks.checked_sub(1) {
-            Some(b) => self.block_start(b) + bp128::block_len(self.buf, self.block_start(b)),
+            Some(b) => self.block_start(b) + pfor128::block_len(self.buf, self.block_start(b)),
             None => 0,
         }
     }
@@ -107,14 +107,14 @@ pub fn encode_sorted(list: &[u32], out: &mut Vec<u8>) {
     encode_with(
         list,
         out,
-        bp128::encode_block_sorted,
-        bp128::encode_tail_sorted,
+        pfor128::encode_block_sorted,
+        pfor128::encode_tail_sorted,
     );
 }
 
 /// Decode the `n` values of a sorted list from `buf`, appending to `out`.
 pub fn decode_sorted(n: usize, buf: &[u8], out: &mut Vec<u32>) {
-    bp128::decode_sorted(n, &buf[aux_len(n)..], out);
+    pfor128::decode_sorted(n, &buf[aux_len(n)..], out);
 }
 
 /// Encode an arbitrary list, appending to `out`; table entries store `0` as
@@ -124,16 +124,16 @@ pub fn encode(list: &[u32], out: &mut Vec<u8>) {
         list,
         out,
         |_, block, out| {
-            bp128::encode_block(block, out);
+            pfor128::encode_block(block, out);
             0
         },
-        |_, tail, out| bp128::encode_tail(tail, out),
+        |_, tail, out| pfor128::encode_tail(tail, out),
     );
 }
 
 /// Decode the `n` values of an unsorted list from `buf`, appending to `out`.
 pub fn decode(n: usize, buf: &[u8], out: &mut Vec<u32>) {
-    bp128::decode(n, &buf[aux_len(n)..], out);
+    pfor128::decode(n, &buf[aux_len(n)..], out);
 }
 
 /// Element `i` of the sorted list: unpacks one block, or walks the tail.
@@ -144,7 +144,7 @@ pub fn get_sorted(n: usize, buf: &[u8], i: usize) -> u32 {
     let b = i / BLOCK;
     if b < table.blocks {
         let mut block = [0; BLOCK];
-        bp128::decode_block_sorted(table.base(b), buf, &mut table.block_start(b), &mut block);
+        pfor128::decode_block_sorted(table.base(b), buf, &mut table.block_start(b), &mut block);
         return block[i % BLOCK];
     }
     let mut byte = table.tail_start();
@@ -162,7 +162,7 @@ pub fn get(n: usize, buf: &[u8], i: usize) -> u32 {
     let b = i / BLOCK;
     if b < table.blocks {
         let mut block = [0; BLOCK];
-        bp128::decode_block(buf, &mut table.block_start(b), &mut block);
+        pfor128::decode_block(buf, &mut table.block_start(b), &mut block);
         return block[i % BLOCK];
     }
     let mut byte = table.tail_start();
@@ -224,7 +224,7 @@ impl<'a> SortedCursor<'a> {
 
     #[inline(never)]
     fn unpack(&mut self, b: usize) {
-        bp128::decode_block_sorted(
+        pfor128::decode_block_sorted(
             self.table.base(b),
             self.buf,
             &mut self.table.block_start(b),
@@ -321,7 +321,7 @@ impl Cursor for SortedCursor<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bp128::tests::{check_cursor, sorted_cases, unsorted_cases};
+    use crate::pfor128::tests::{check_cursor, sorted_cases, unsorted_cases};
 
     #[test]
     fn sorted_roundtrip() {
@@ -352,12 +352,12 @@ mod tests {
     }
 
     #[test]
-    fn table_then_bp128_payload() {
+    fn table_then_pfor128_payload() {
         let list: Vec<u32> = (0..300).map(|i| i * 7).collect();
         let mut buf = Vec::new();
         encode_sorted(&list, &mut buf);
         let mut plain = Vec::new();
-        bp128::encode_sorted(&list, &mut plain);
+        pfor128::encode_sorted(&list, &mut plain);
         assert_eq!(aux_len(list.len()), 16);
         assert_eq!(buf[16..], plain);
         let table = Table::new(list.len(), &buf);
