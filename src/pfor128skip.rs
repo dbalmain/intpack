@@ -276,18 +276,6 @@ impl<'a> SortedCursor<'a> {
         }
     }
 
-    /// Index of the first id `>= target` in the loaded block, at or after
-    /// `start`. The block's last id is `>= target`.
-    #[inline]
-    fn position(&self, start: usize, target: u32, b: usize) -> usize {
-        for j in start..BLOCK {
-            if self.block[j] >= target {
-                return j;
-            }
-        }
-        unreachable!("block {b} ends at or past {target}")
-    }
-
     /// Position at the end of the last full block, ready to read the tail;
     /// the delta base is the table's last entry.
     fn enter_tail(&mut self) {
@@ -348,7 +336,10 @@ impl Cursor for SortedCursor<'_> {
             }
             j
         } else {
-            self.position(start, target, b)
+            match pfor128::scan_geq(&self.block, start, target) {
+                Some(j) => j,
+                None => unreachable!("block {b} ends at or past {target}"),
+            }
         };
         self.pos = b * BLOCK + j + 1;
         self.cur = Some(self.value_at(j));

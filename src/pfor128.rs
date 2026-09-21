@@ -264,6 +264,62 @@ pub fn decode(n: usize, buf: &[u8], out: &mut Vec<u32>) {
 
 // ── cursor ──
 
+/// First index in `block[start..]` whose value is `>= target`.
+///
+/// The scalar loop is the reference. SSE2 compares four lanes at a time;
+/// `_mm_cmpgt_epi32` is signed, so both sides are xored with `0x8000_0000`
+/// and the unsigned order falls out of the signed compare.
+#[inline]
+pub(crate) fn scan_geq(block: &[u32; BLOCK], start: usize, target: u32) -> Option<usize> {
+    #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+    // SAFETY: `scan_geq_sse2` requires SSE2, and this arm is compiled only
+    // where that feature is enabled.
+    unsafe {
+        scan_geq_sse2(block, start, target)
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "sse2")))]
+    scan_geq_scalar(block, start, target)
+}
+
+#[cfg(any(test, not(all(target_arch = "x86_64", target_feature = "sse2"))))]
+fn scan_geq_scalar(block: &[u32; BLOCK], start: usize, target: u32) -> Option<usize> {
+    (start..BLOCK).find(|&j| block[j] >= target)
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+#[target_feature(enable = "sse2")]
+fn scan_geq_sse2(block: &[u32; BLOCK], start: usize, target: u32) -> Option<usize> {
+    use core::arch::x86_64::{
+        _mm_castsi128_ps, _mm_cmpgt_epi32, _mm_loadu_si128, _mm_movemask_ps, _mm_set1_epi32,
+        _mm_xor_si128,
+    };
+    // SAFETY: each load is a 16-byte group inside `block` (`i` stays on a
+    // 4-element boundary and stops at `BLOCK`). The xor maps unsigned order
+    // onto a signed compare; movemask reads the sign bit of each lane.
+    unsafe {
+        let bias = _mm_set1_epi32(i32::MIN);
+        let needle = _mm_xor_si128(_mm_set1_epi32(target as i32), bias);
+        let mut i = start & !3;
+        // Only the first group has lanes before `start`. Later groups are whole.
+        let mut skip = (start - i) as u32;
+        while i < BLOCK {
+            let below = _mm_cmpgt_epi32(
+                needle,
+                _mm_xor_si128(_mm_loadu_si128(block.as_ptr().add(i).cast()), bias),
+            );
+            // Bit `lane` set where the value is `>= target`.
+            let hits =
+                (((!_mm_movemask_ps(_mm_castsi128_ps(below))) & 0b1111) as u32 >> skip) << skip;
+            if hits != 0 {
+                return Some(i + hits.trailing_zeros() as usize);
+            }
+            i += 4;
+            skip = 0;
+        }
+        None
+    }
+}
+
 /// Block-at-a-time cursor over a sorted list: unpacks each full block when
 /// the scan enters it, then reads the tail varint by varint. A width-0 block
 /// is 128 consecutive ids and is not unpacked.
@@ -342,12 +398,10 @@ impl Cursor for SortedCursor<'_> {
                 self.cur = Some(first + j as u32);
                 return self.cur;
             }
-            for j in start..BLOCK {
-                if self.block[j] >= target {
-                    self.pos = b * BLOCK + j + 1;
-                    self.cur = Some(self.block[j]);
-                    return self.cur;
-                }
+            if let Some(j) = scan_geq(&self.block, start, target) {
+                self.pos = b * BLOCK + j + 1;
+                self.cur = Some(self.block[j]);
+                return self.cur;
             }
             self.pos = (b + 1) * BLOCK;
             self.cur = Some(self.block[BLOCK - 1]);
@@ -616,6 +670,44 @@ pub(crate) mod tests {
             let mut back = Vec::new();
             decode_sorted(list.len(), &buf, &mut back);
             assert_eq!(back, list, "width {width}");
+        }
+    }
+
+    #[test]
+    fn scan_agrees_on_random_blocks() {
+        let mut rng = StdRng::seed_from_u64(11);
+        let mut blocks = vec![
+            [0u32; BLOCK],
+            [u32::MAX; BLOCK],
+            std::array::from_fn(|i| i as u32),
+            std::array::from_fn(|i| u32::MAX - i as u32),
+        ];
+        for _ in 0..32 {
+            blocks.push(std::array::from_fn(|_| rng.random()));
+        }
+        let targets = [0, 1, 2, 0x7fff_ffff, 0x8000_0000, u32::MAX, u32::MAX - 1];
+        for block in &blocks {
+            for &target in &targets {
+                for start in [0, 1, 2, 3, 4, 5, 63, 64, 127, 128] {
+                    assert_eq!(
+                        scan_geq(block, start, target),
+                        scan_geq_scalar(block, start, target),
+                        "start {start} target {target:#x}"
+                    );
+                }
+            }
+            // Targets taken from the block, including from the lanes a group
+            // would otherwise mask off.
+            for index in [0, 1, 3, 4, 127] {
+                let target = block[index];
+                for start in 0..=index {
+                    assert_eq!(
+                        scan_geq(block, start, target),
+                        scan_geq_scalar(block, start, target),
+                        "value at {index}, start {start}"
+                    );
+                }
+            }
         }
     }
 
