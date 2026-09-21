@@ -21,6 +21,17 @@ pub fn encode(base: Option<u32>, list: &[u32], out: &mut Vec<u32>) {
 
 /// Inverse of [`encode`], in place.
 pub fn decode(base: Option<u32>, deltas: &mut [u32]) {
+    #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+    // SAFETY: this branch is compiled only when SSE2 is enabled.
+    unsafe {
+        simd::decode(base, deltas);
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "sse2")))]
+    decode_scalar(base, deltas);
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_feature = "sse2")))]
+fn decode_scalar(base: Option<u32>, deltas: &mut [u32]) {
     let mut prev = base;
     for d in deltas {
         let v = value(prev, *d);

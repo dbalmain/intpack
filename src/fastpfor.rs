@@ -5,10 +5,12 @@
 //! arrays, themselves bit-packed with [`bits`]. A `VariableByte` tail covers
 //! `n % 128`.
 //!
-//! The on-disk layout is ours; the cost model matches the paper / the
-//! `fastpfor` crate, so density comes out the same. The 128-int payload is
-//! the shared bitpack kernel (four interleaved lanes). Exception arrays are
-//! a sequential LSB-first bit stream, byte-aligned, the cold path.
+//! Unlike [`bp128`](crate::bp128)'s at-most-seven inline byte patches,
+//! FastPFor chooses exception counts by a cost model and collects high parts
+//! across a page. The on-disk layout is ours; the cost model matches the
+//! paper / the `fastpfor` crate, so density comes out the same. The 128-int
+//! payload is the shared bitpack kernel (four interleaved lanes). Exception
+//! arrays are a sequential LSB-first bit stream, byte-aligned, the cold path.
 
 use crate::bitpack::{self, BLOCK};
 use crate::{bits, delta, vbyte};

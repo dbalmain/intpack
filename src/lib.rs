@@ -33,7 +33,7 @@
 //! | [`vbyte`] | LEB128 varint | ✓ | ✓ | scan | — |
 //! | [`streamvbyte`] | 2-bit control stream + data | ✓ | ✓ | — | — |
 //! | [`bitpack`] | 128-int block kernels (the primitive) | | | | |
-//! | [`bp128`] | bitpacked 128-blocks + vbyte tail | ✓ | ✓ | scan | — |
+//! | [`bp128`] | patched bitpacked 128-blocks + vbyte tail | ✓ | ✓ | scan | — |
 //! | [`bp128skip`] | bp128 + skip table | ✓ | ✓ | ✓ | ✓ |
 //! | [`fastpfor`] | patched frame-of-reference over blocks | ✓ | ✓ | — | — |
 //! | [`elias_fano`] | EF with sampled select | ✓ | — | ✓ | ✓ |

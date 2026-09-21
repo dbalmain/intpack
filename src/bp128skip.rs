@@ -5,7 +5,7 @@
 //!
 //! Layout, little-endian: `n / 128` entries of `last_value: u32` (the block's
 //! final element, which is the next block's delta base; `0` for unsorted
-//! lists) then `byte_offset: u32` (the block's width byte, relative to the
+//! lists) then `byte_offset: u32` (the block's token byte, relative to the
 //! payload start); then the `bp128` payload. The table's length follows from
 //! `n`, so a list shorter than one block is byte-identical to `bp128`.
 //!
@@ -393,6 +393,40 @@ mod tests {
         assert_eq!(cursor.unpacked, 1);
         assert_eq!(cursor.next_geq(1_280_000 - 100), list.last().copied());
         assert_eq!(cursor.unpacked, 2);
+    }
+
+    #[test]
+    fn patched_blocks_support_seek_and_get() {
+        let mut gaps = [0u32; BLOCK];
+        gaps[64] = 86_000;
+        delta::decode(None, &mut gaps);
+        let list = gaps.to_vec();
+        let mut buf = Vec::new();
+        encode_sorted(&list, &mut buf);
+        let mut cursor = SortedCursor::new(list.len(), &buf);
+        assert_eq!(cursor.next_geq(list[63] + 1), Some(list[64]));
+        assert_eq!(get_sorted(list.len(), &buf, 64), list[64]);
+        assert_eq!(get_sorted(list.len(), &buf, 127), list[127]);
+    }
+
+    #[test]
+    fn raw_escapes_support_unsorted_get() {
+        for mut block in [[0; BLOCK], [1 << 30; BLOCK]] {
+            if block[7] == 0 {
+                block[..8].fill(u32::MAX);
+            } else {
+                block[..7].fill(u32::MAX);
+            }
+            let mut buf = Vec::new();
+            encode(&block, &mut buf);
+            assert_eq!(buf[aux_len(BLOCK)], u8::MAX);
+            let mut back = Vec::new();
+            decode(BLOCK, &buf, &mut back);
+            assert_eq!(back, block);
+            for i in [0, 6, 7, BLOCK - 1] {
+                assert_eq!(get(BLOCK, &buf, i), block[i]);
+            }
+        }
     }
 
     #[test]
