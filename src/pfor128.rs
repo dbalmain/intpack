@@ -42,9 +42,10 @@ const fn bits_required(value: u32) -> u32 {
 /// and an exception high part may occupy at most one byte.
 fn patched_width(block: &[u32; BLOCK]) -> (u32, usize) {
     let max_bits = bitpack::width(block);
-    let mut ordered = *block;
-    ordered.sort_unstable();
-    let width = bits_required(ordered[BLOCK - 8]).max(max_bits.saturating_sub(8));
+    let mut copy = *block;
+    // Eighth-largest: the element at `BLOCK - 8` once the copy is partitioned.
+    let (_, eighth, _) = copy.select_nth_unstable(BLOCK - 8);
+    let width = bits_required(*eighth).max(max_bits.saturating_sub(8));
     let mask = low_mask(width);
     let exceptions = block.iter().filter(|&&v| v > mask).count();
     debug_assert!(exceptions <= MAX_EXCEPTIONS);
