@@ -265,7 +265,8 @@ pub fn decode(n: usize, buf: &[u8], out: &mut Vec<u32>) {
 // ── cursor ──
 
 /// Block-at-a-time cursor over a sorted list: unpacks each full block when
-/// the scan enters it, then reads the tail varint by varint.
+/// the scan enters it, then reads the tail varint by varint. A width-0 block
+/// is 128 consecutive ids and is not unpacked.
 pub struct SortedCursor<'a> {
     buf: &'a [u8],
     n: usize,
@@ -274,6 +275,9 @@ pub struct SortedCursor<'a> {
     /// Where the next block, or the next tail varint, starts in `buf`.
     byte: usize,
     block: [u32; BLOCK],
+    /// `Some(first)` when the current block is a width-0 run — element `j`
+    /// is `first + j` — and `block` is stale.
+    run: Option<u32>,
     /// The current element, `None` before the first and after the last.
     cur: Option<u32>,
 }
@@ -288,7 +292,22 @@ impl<'a> SortedCursor<'a> {
             pos: 0,
             byte: 0,
             block: [0; BLOCK],
+            run: None,
             cur: None,
+        }
+    }
+
+    /// Decode the block at `pos`, or record a width-0 run. A zero token is
+    /// one byte: width 0 packs to nothing and there are no exceptions, and
+    /// every gap is 0, so the ids are `first, first + 1, …` with `first`
+    /// being `cur + 1` (or `0` at the head of the list).
+    fn enter_block(&mut self) {
+        if self.buf[self.byte] == 0 {
+            self.run = Some(delta::value(self.cur, 0));
+            self.byte += 1;
+        } else {
+            self.run = None;
+            decode_block_sorted(self.cur, self.buf, &mut self.byte, &mut self.block);
         }
     }
 }
@@ -299,6 +318,39 @@ impl Cursor for SortedCursor<'_> {
             && cur >= target
         {
             return Some(cur);
+        }
+        let full = self.n / BLOCK * BLOCK;
+        while self.pos < full {
+            let b = self.pos / BLOCK;
+            let start = self.pos % BLOCK;
+            if start == 0 {
+                self.enter_block();
+            }
+            if let Some(first) = self.run {
+                let last = first + (BLOCK as u32 - 1);
+                if last < target {
+                    self.pos = (b + 1) * BLOCK;
+                    self.cur = Some(last);
+                    continue;
+                }
+                let j = if target <= first {
+                    start
+                } else {
+                    ((target - first) as usize).max(start)
+                };
+                self.pos = b * BLOCK + j + 1;
+                self.cur = Some(first + j as u32);
+                return self.cur;
+            }
+            for j in start..BLOCK {
+                if self.block[j] >= target {
+                    self.pos = b * BLOCK + j + 1;
+                    self.cur = Some(self.block[j]);
+                    return self.cur;
+                }
+            }
+            self.pos = (b + 1) * BLOCK;
+            self.cur = Some(self.block[BLOCK - 1]);
         }
         while let Some(v) = self.next() {
             if v >= target {
@@ -317,9 +369,12 @@ impl Cursor for SortedCursor<'_> {
         // previous block's last value, or the previous tail value.
         let v = if self.pos < self.n / BLOCK * BLOCK {
             if self.pos.is_multiple_of(BLOCK) {
-                decode_block_sorted(self.cur, self.buf, &mut self.byte, &mut self.block);
+                self.enter_block();
             }
-            self.block[self.pos % BLOCK]
+            match self.run {
+                Some(first) => first + (self.pos % BLOCK) as u32,
+                None => self.block[self.pos % BLOCK],
+            }
         } else {
             delta::value(self.cur, vbyte::take(self.buf, &mut self.byte))
         };
