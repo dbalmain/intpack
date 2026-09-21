@@ -96,7 +96,7 @@ pub(crate) fn encode_block(block: &[u32; BLOCK], out: &mut Vec<u8>) {
     encode_values(block, out);
 }
 
-/// Decode the full block whose width byte is at `buf[*byte]`, advancing
+/// Decode the full block whose token byte is at `buf[*byte]`, advancing
 /// `*byte` past it. Returns the block's last value.
 pub(crate) fn decode_block_sorted(
     base: Option<u32>,
@@ -462,6 +462,14 @@ pub(crate) mod tests {
             block[index] = 86_000;
             let buf = check_unsorted_block(block);
             assert_eq!(&buf[..3], &[(1 << 5) | 9, index as u8, 167]);
+
+            let list = values_from_gaps(block);
+            let mut buf = Vec::new();
+            encode_sorted(&list, &mut buf);
+            assert_eq!(&buf[..3], &[(1 << 5) | 9, index as u8, 167]);
+            let mut back = Vec::new();
+            decode_sorted(list.len(), &buf, &mut back);
+            assert_eq!(back, list);
         }
     }
 
