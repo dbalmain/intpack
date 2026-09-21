@@ -63,8 +63,40 @@ impl<'a> Table<'a> {
 
     /// First block at or after `from` whose last value is `>= target`, or
     /// `blocks` if none: the tail, if anything, holds the target.
+    ///
+    /// The current block is checked first. A search from block 0 then
+    /// binary-searches the rest: galloping the whole table is about twice
+    /// the probes, and a fresh cursor's seek must not pay that. From any
+    /// later block the probe gallops 1, 2, 4, … blocks ahead of `from` and
+    /// binary-searches the bracket.
     fn find(&self, from: usize, target: u32) -> usize {
-        let (mut lo, mut hi) = (from, self.blocks);
+        if from >= self.blocks {
+            return self.blocks;
+        }
+        if self.last(from) >= target {
+            return from;
+        }
+        if from == 0 {
+            return self.binsearch(1, self.blocks, target);
+        }
+        let mut prev = from;
+        let mut step = 1usize;
+        loop {
+            let probe = from.saturating_add(step);
+            if probe >= self.blocks || self.last(probe) >= target {
+                let hi = if probe >= self.blocks {
+                    self.blocks
+                } else {
+                    probe + 1
+                };
+                return self.binsearch(prev + 1, hi, target);
+            }
+            prev = probe;
+            step = step.saturating_mul(2);
+        }
+    }
+
+    fn binsearch(&self, mut lo: usize, mut hi: usize, target: u32) -> usize {
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
             if self.last(mid) < target {
@@ -186,10 +218,11 @@ enum Loaded {
     Run { index: usize, first: u32 },
 }
 
-/// Skip cursor over a sorted list. `next_geq` binary-searches the table from
-/// the current block. A block whose token is `0` is 128 consecutive ids and
-/// is answered from the table's base; any other block is unpacked and
-/// scanned. The tail is entered from the table's last entry.
+/// Skip cursor over a sorted list. `next_geq` finds a block in the skip
+/// table — current block first, then a gallop, or a binary search when that
+/// starts at block 0 — and unpacks only the block it lands in. A block whose
+/// token is `0` is 128 consecutive ids and is answered from the table's base.
+/// The tail is entered from the table's last entry.
 pub struct SortedCursor<'a> {
     buf: &'a [u8],
     n: usize,
@@ -615,5 +648,71 @@ mod tests {
         assert_eq!(cursor.next_geq(u32::MAX), Some(u32::MAX), "last id");
         assert_eq!(cursor.unpacked, 0);
         assert_eq!(cursor.next(), None);
+    }
+
+    #[test]
+    fn gallop_lands_on_block_ends_and_past_the_list() {
+        let mut list: Vec<u32> = (0..128 * 16).map(|i| i * 3 + 10).collect();
+        let tail = list[list.len() - 1] + 5;
+        list.push(tail);
+        list.push(tail + 9);
+        let mut buf = Vec::new();
+        encode_sorted(&list, &mut buf);
+
+        // Block 1, then several blocks ahead: the gallop, not the block-0 search.
+        let mut cursor = SortedCursor::new(list.len(), &buf);
+        assert_eq!(cursor.next_geq(list[128]), Some(list[128]));
+        assert_eq!(
+            cursor.next_geq(list[10 * 128]),
+            Some(list[10 * 128]),
+            "first"
+        );
+        assert_eq!(
+            cursor.next_geq(list[10 * 128 + 127]),
+            Some(list[10 * 128 + 127]),
+            "last"
+        );
+
+        let mut fresh = SortedCursor::new(list.len(), &buf);
+        assert_eq!(fresh.next_geq(list[6 * 128]), Some(list[6 * 128]));
+        let mut fresh = SortedCursor::new(list.len(), &buf);
+        assert_eq!(
+            fresh.next_geq(list[6 * 128 + 127]),
+            Some(list[6 * 128 + 127])
+        );
+        assert_eq!(fresh.next_geq(tail), Some(tail), "tail");
+        assert_eq!(fresh.next_geq(tail + 9), Some(tail + 9));
+        assert_eq!(fresh.next_geq(tail + 10), None, "past the list");
+    }
+
+    #[test]
+    fn gallop_agrees_with_a_binary_search() {
+        let list: Vec<u32> = (0..128 * 20 + 3).map(|i| i * 5 + 1).collect();
+        let mut buf = Vec::new();
+        encode_sorted(&list, &mut buf);
+        let table = Table::new(list.len(), &buf);
+        let binary = |from: usize, target: u32| {
+            let (mut lo, mut hi) = (from, table.blocks);
+            while lo < hi {
+                let mid = lo + (hi - lo) / 2;
+                if table.last(mid) < target {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
+            }
+            lo
+        };
+        for from in 0..=table.blocks {
+            assert_eq!(table.find(from, 0), binary(from, 0), "from {from}");
+            assert_eq!(table.find(from, u32::MAX), binary(from, u32::MAX));
+            for b in from..table.blocks {
+                let last = table.last(b);
+                assert_eq!(table.find(from, last), binary(from, last), "block {b}");
+                if last < u32::MAX {
+                    assert_eq!(table.find(from, last + 1), binary(from, last + 1));
+                }
+            }
+        }
     }
 }
