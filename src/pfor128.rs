@@ -724,6 +724,19 @@ impl<'a> SortedCursor<'a> {
     }
 }
 
+/// `v`, as a value the optimiser must materialise here: an empty asm
+/// with `v` as an in-out register costs no instruction and keeps LLVM from
+/// hoisting what is computed from `v` out of the enclosing loop.
+#[inline(always)]
+fn pin(mut v: u32) -> u32 {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: the asm is empty and only names a register operand.
+    unsafe {
+        core::arch::asm!("/* {0:e} */", inout(reg) v, options(pure, nomem, nostack, preserves_flags));
+    }
+    v
+}
+
 impl Cursor for SortedCursor<'_> {
     fn next_geq(&mut self, target: u32) -> Option<u32> {
         if let Some(cur) = self.cur
@@ -761,6 +774,11 @@ impl Cursor for SortedCursor<'_> {
                     bits.last()
                 }
                 Entered::Values => {
+                    // Pin `target` to this iteration: LLVM otherwise hoists
+                    // the scan's broadcast of it above the loop and spills the
+                    // vector across `enter_block`, and every call then pays a
+                    // store-forward of it on the way to the compare.
+                    let target = pin(target);
                     if let Some(j) = scan_geq(&self.block, start, target) {
                         return self.land(b, j, self.block[j]);
                     }
