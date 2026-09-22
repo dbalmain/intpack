@@ -7,7 +7,9 @@
 //! final element, which is the next block's delta base; `0` for unsorted
 //! lists) then `byte_offset: u32` (the block's token byte, relative to the
 //! payload start); then the `pfor128` payload. The table's length follows from
-//! `n`, so a list shorter than one block is byte-identical to `pfor128`.
+//! `n`, so a list shorter than one block is byte-identical to `pfor128`. Every
+//! block kind — packed, run, bitset, raw — has a last value and an offset, so
+//! the table does not care which it points at.
 //!
 //! [`pfor128`]: crate::pfor128
 

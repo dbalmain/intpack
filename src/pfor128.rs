@@ -15,8 +15,17 @@
 //! front. Token `0xff` escapes to 128 raw little-endian `u32`s of the
 //! original values and carries no minimum; the escape is decided on the
 //! values that would have been packed, so a block whose originals sit at or
-//! above `2^31` can still pack once the minimum is subtracted. The `n % 128`
-//! values after the last full block are LEB128 varints. Sorted gaps follow
+//! above `2^31` can still pack once the minimum is subtracted. Seven
+//! exceptions at width 30 would be token `0xfe`; that block goes raw too,
+//! and `0xfe` marks a **bitset** block, sorted lists only: the gap-1 of the
+//! block's first id from its base as a varint, a body length byte, then
+//! that many bytes in which bit `i` is set iff `first + i` is in the list
+//! (bit 0 always is). A block is a bitset when that is strictly fewer bytes
+//! than patching it — dense stretches whose eighth-largest gap still forces
+//! a wide packed block — and never when its span exceeds 2040 ids; a tie
+//! stays packed, and a width-0 run is one byte and always wins. `next_geq`
+//! on a bitset is a word operation with no decode. The `n % 128` values
+//! after the last full block are LEB128 varints. Sorted gaps follow
 //! [`delta`]: the first block's first value as-is, each later value `gap - 1`
 //! from the one before it, across block boundaries, so a block's delta base
 //! is the previous block's last value and the tail continues from the last
@@ -368,8 +377,7 @@ impl<'a> Bitset<'a> {
     }
 
     /// The `j`th id of the block: popcount to its word, then select in it.
-    pub(crate) fn select(&self, j: usize) -> u32 {
-        let mut j = j;
+    pub(crate) fn select(&self, mut j: usize) -> u32 {
         for wi in 0..self.words() {
             let word = self.word(wi);
             let count = word.count_ones() as usize;
