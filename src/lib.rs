@@ -10,6 +10,10 @@
 //! bit. A reader who wants the algorithm reads the module; a reader who wants
 //! the speed reads the kernel.
 //!
+//! A handful of inlining attributes and one empty `asm!` steer LLVM rather
+//! than express the algorithm; they are listed in `src/toolchain.rs`, whose
+//! test fails when the compiler changes so each is re-measured.
+//!
 //! # Contract shared by every codec
 //!
 //! * A list's **length** `n` is stored out of band by the caller (an index
@@ -49,6 +53,8 @@ pub mod pef;
 pub mod pfor128;
 pub mod pfor128skip;
 pub mod streamvbyte;
+#[cfg(test)]
+mod toolchain;
 pub mod vbyte;
 
 pub use cursor::Cursor;

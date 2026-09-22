@@ -589,7 +589,8 @@ fn scan_geq_scalar(block: &[u32; BLOCK], start: usize, target: u32) -> Option<us
     (start..BLOCK).find(|&j| block[j] >= target)
 }
 
-#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+#[cfg(any(test, all(target_arch = "x86_64", target_feature = "avx512f")))]
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
 fn scan_geq_avx512(block: &[u32; BLOCK], start: usize, target: u32) -> Option<usize> {
     use core::arch::x86_64::{_mm512_cmpge_epu32_mask, _mm512_loadu_si512, _mm512_set1_epi32};
@@ -615,11 +616,15 @@ fn scan_geq_avx512(block: &[u32; BLOCK], start: usize, target: u32) -> Option<us
     }
 }
 
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "sse2",
-    not(target_feature = "avx512f")
+#[cfg(any(
+    test,
+    all(
+        target_arch = "x86_64",
+        target_feature = "sse2",
+        not(target_feature = "avx512f")
+    )
 ))]
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse2")]
 fn scan_geq_sse2(block: &[u32; BLOCK], start: usize, target: u32) -> Option<usize> {
     use core::arch::x86_64::{
@@ -727,6 +732,11 @@ impl<'a> SortedCursor<'a> {
 /// `v`, as a value the optimiser must materialise here: an empty asm
 /// with `v` as an in-out register costs no instruction and keeps LLVM from
 /// hoisting what is computed from `v` out of the enclosing loop.
+///
+/// A bet on one compiler's register allocation, not part of the algorithm:
+/// it is on the ledger in `src/toolchain.rs`, whose test fails when rustc
+/// changes so the measurement behind it is repeated. Removing it must cost
+/// nothing but speed.
 #[inline(always)]
 fn pin(mut v: u32) -> u32 {
     #[cfg(target_arch = "x86_64")]
@@ -1283,6 +1293,26 @@ pub(crate) mod tests {
         }
     }
 
+    type Scan = fn(&[u32; BLOCK], usize, u32) -> Option<usize>;
+
+    /// Every `scan_geq` arm the host can execute, whichever one the crate
+    /// was compiled to dispatch: the SIMD arms are compiled for tests on any
+    /// x86_64 and run under runtime feature detection, so a baseline
+    /// `cargo test` on an AVX-512 host covers all three.
+    fn scan_arms() -> Vec<(&'static str, Scan)> {
+        let mut arms: Vec<(&str, Scan)> = vec![("dispatched", scan_geq)];
+        #[cfg(target_arch = "x86_64")]
+        {
+            // SAFETY: every x86_64 target has SSE2.
+            arms.push(("sse2", |b, s, t| unsafe { scan_geq_sse2(b, s, t) }));
+            if std::arch::is_x86_feature_detected!("avx512f") {
+                // SAFETY: AVX-512F was just detected on this host.
+                arms.push(("avx512", |b, s, t| unsafe { scan_geq_avx512(b, s, t) }));
+            }
+        }
+        arms
+    }
+
     #[test]
     fn scan_agrees_on_random_blocks() {
         let mut rng = StdRng::seed_from_u64(11);
@@ -1296,26 +1326,28 @@ pub(crate) mod tests {
             blocks.push(std::array::from_fn(|_| rng.random()));
         }
         let targets = [0, 1, 2, 0x7fff_ffff, 0x8000_0000, u32::MAX, u32::MAX - 1];
-        for block in &blocks {
-            for &target in &targets {
-                for start in [0, 1, 2, 3, 4, 5, 63, 64, 127, 128] {
-                    assert_eq!(
-                        scan_geq(block, start, target),
-                        scan_geq_scalar(block, start, target),
-                        "start {start} target {target:#x}"
-                    );
+        for (arm, scan) in scan_arms() {
+            for block in &blocks {
+                for &target in &targets {
+                    for start in [0, 1, 2, 3, 4, 5, 15, 16, 17, 63, 64, 127, 128] {
+                        assert_eq!(
+                            scan(block, start, target),
+                            scan_geq_scalar(block, start, target),
+                            "{arm}: start {start} target {target:#x}"
+                        );
+                    }
                 }
-            }
-            // Targets taken from the block, including from the lanes a group
-            // would otherwise mask off.
-            for index in [0, 1, 3, 4, 127] {
-                let target = block[index];
-                for start in 0..=index {
-                    assert_eq!(
-                        scan_geq(block, start, target),
-                        scan_geq_scalar(block, start, target),
-                        "value at {index}, start {start}"
-                    );
+                // Targets taken from the block, including from the lanes a
+                // group would otherwise mask off.
+                for index in [0, 1, 3, 4, 15, 16, 127] {
+                    let target = block[index];
+                    for start in 0..=index {
+                        assert_eq!(
+                            scan(block, start, target),
+                            scan_geq_scalar(block, start, target),
+                            "{arm}: value at {index}, start {start}"
+                        );
+                    }
                 }
             }
         }
