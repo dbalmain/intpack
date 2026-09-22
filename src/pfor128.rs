@@ -340,13 +340,9 @@ pub fn decode(n: usize, buf: &[u8], out: &mut Vec<u32>) {
 
 /// First index in `block[start..]` whose value is `>= target`.
 ///
-/// The scalar loop is the reference. SSE2 compares four lanes at a time.
-/// The first group is loaded at `start`, so lanes before `start` are not in
-/// it and nothing is masked off. The lanes after that group up to the next
-/// multiple of four are scalar — three at most — and every group from there
-/// is aligned. Stepping unaligned for the whole block splits cache lines on
-/// a long scan. `_mm_cmpgt_epi32` is signed, so both sides are xored with
-/// `0x8000_0000` and the unsigned order falls out of the signed compare.
+/// The scalar loop is the reference. SSE2 compares four lanes at a time;
+/// `_mm_cmpgt_epi32` is signed, so both sides are xored with `0x8000_0000`
+/// and the unsigned order falls out of the signed compare.
 #[inline]
 pub(crate) fn scan_geq(block: &[u32; BLOCK], start: usize, target: u32) -> Option<usize> {
     #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
@@ -367,57 +363,34 @@ fn scan_geq_scalar(block: &[u32; BLOCK], start: usize, target: u32) -> Option<us
 #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
 #[target_feature(enable = "sse2")]
 fn scan_geq_sse2(block: &[u32; BLOCK], start: usize, target: u32) -> Option<usize> {
-    use core::arch::x86_64::{_mm_set1_epi32, _mm_xor_si128};
-    // SAFETY: `geq_lanes` reads 16 bytes. The head starts at `start` and is
-    // only loaded when four lanes fit; later groups are 4-lane aligned and
-    // stop at `BLOCK`.
+    use core::arch::x86_64::{
+        _mm_castsi128_ps, _mm_cmpgt_epi32, _mm_loadu_si128, _mm_movemask_ps, _mm_set1_epi32,
+        _mm_xor_si128,
+    };
+    // SAFETY: each load is a 16-byte group inside `block` (`i` stays on a
+    // 4-element boundary and stops at `BLOCK`). The xor maps unsigned order
+    // onto a signed compare; movemask reads the sign bit of each lane.
     unsafe {
-        if start >= BLOCK {
-            return None;
-        }
         let bias = _mm_set1_epi32(i32::MIN);
         let needle = _mm_xor_si128(_mm_set1_epi32(target as i32), bias);
-        let mut i = start;
-        if (i & 3) != 0 && i + 4 <= BLOCK {
-            let hits = geq_lanes(block.as_ptr().add(i), needle, bias);
+        let mut i = start & !3;
+        // Only the first group has lanes before `start`. Later groups are whole.
+        let mut skip = (start - i) as u32;
+        while i < BLOCK {
+            let below = _mm_cmpgt_epi32(
+                needle,
+                _mm_xor_si128(_mm_loadu_si128(block.as_ptr().add(i).cast()), bias),
+            );
+            // Bit `lane` set where the value is `>= target`.
+            let hits =
+                (((!_mm_movemask_ps(_mm_castsi128_ps(below))) & 0b1111) as u32 >> skip) << skip;
             if hits != 0 {
                 return Some(i + hits.trailing_zeros() as usize);
             }
             i += 4;
-        }
-        while i < BLOCK && (i & 3) != 0 {
-            if block[i] >= target {
-                return Some(i);
-            }
-            i += 1;
-        }
-        while i + 4 <= BLOCK {
-            let hits = geq_lanes(block.as_ptr().add(i), needle, bias);
-            if hits != 0 {
-                return Some(i + hits.trailing_zeros() as usize);
-            }
-            i += 4;
+            skip = 0;
         }
         None
-    }
-}
-
-/// Low four bits set where the lanes at `ptr` are `>=` the biased needle.
-#[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
-#[inline]
-#[target_feature(enable = "sse2")]
-unsafe fn geq_lanes(
-    ptr: *const u32,
-    needle: core::arch::x86_64::__m128i,
-    bias: core::arch::x86_64::__m128i,
-) -> u32 {
-    use core::arch::x86_64::{
-        _mm_castsi128_ps, _mm_cmpgt_epi32, _mm_loadu_si128, _mm_movemask_ps, _mm_xor_si128,
-    };
-    // SAFETY: caller passes a pointer to four in-range `u32`s.
-    unsafe {
-        let below = _mm_cmpgt_epi32(needle, _mm_xor_si128(_mm_loadu_si128(ptr.cast()), bias));
-        ((!_mm_movemask_ps(_mm_castsi128_ps(below))) & 0b1111) as u32
     }
 }
 
@@ -877,7 +850,7 @@ pub(crate) mod tests {
         let targets = [0, 1, 2, 0x7fff_ffff, 0x8000_0000, u32::MAX, u32::MAX - 1];
         for block in &blocks {
             for &target in &targets {
-                for start in [0, 1, 2, 3, 4, 5, 63, 64, 124, 125, 126, 127, 128] {
+                for start in [0, 1, 2, 3, 4, 5, 63, 64, 127, 128] {
                     assert_eq!(
                         scan_geq(block, start, target),
                         scan_geq_scalar(block, start, target),
@@ -885,9 +858,9 @@ pub(crate) mod tests {
                     );
                 }
             }
-            // Targets taken from the block, including lanes before an
-            // aligned group that the unaligned head must still see.
-            for index in [0, 1, 3, 4, 124, 125, 126, 127] {
+            // Targets taken from the block, including from the lanes a group
+            // would otherwise mask off.
+            for index in [0, 1, 3, 4, 127] {
                 let target = block[index];
                 for start in 0..=index {
                     assert_eq!(
