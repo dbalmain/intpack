@@ -340,13 +340,13 @@ pub fn decode(n: usize, buf: &[u8], out: &mut Vec<u32>) {
 
 /// First index in `block[start..]` whose value is `>= target`.
 ///
-/// `block` is non-decreasing, which is what the sorted cursors pass. The
-/// scalar loop is the reference. SSE2 compares four lanes at a time, loaded
-/// from `start` rather than from the aligned group, so no lane before
-/// `start` is masked off. A partial tail re-reads `block[BLOCK - 4..]` and
-/// keeps the first hit at index `>= start`; that is the answer because the
-/// block is sorted. `_mm_cmpgt_epi32` is signed, so both sides are xored
-/// with `0x8000_0000` and the unsigned order falls out of the signed compare.
+/// The scalar loop is the reference. SSE2 compares four lanes at a time.
+/// The first group is loaded at `start`, so lanes before `start` are not in
+/// it and nothing is masked off. The lanes after that group up to the next
+/// multiple of four are scalar — three at most — and every group from there
+/// is aligned. Stepping unaligned for the whole block splits cache lines on
+/// a long scan. `_mm_cmpgt_epi32` is signed, so both sides are xored with
+/// `0x8000_0000` and the unsigned order falls out of the signed compare.
 #[inline]
 pub(crate) fn scan_geq(block: &[u32; BLOCK], start: usize, target: u32) -> Option<usize> {
     #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
@@ -368,12 +368,29 @@ fn scan_geq_scalar(block: &[u32; BLOCK], start: usize, target: u32) -> Option<us
 #[target_feature(enable = "sse2")]
 fn scan_geq_sse2(block: &[u32; BLOCK], start: usize, target: u32) -> Option<usize> {
     use core::arch::x86_64::{_mm_set1_epi32, _mm_xor_si128};
-    // SAFETY: `geq_lanes` reads 16 bytes. Full groups start at `start` and
-    // stop before `BLOCK`; the tail group is `block[BLOCK - 4..]`.
+    // SAFETY: `geq_lanes` reads 16 bytes. The head starts at `start` and is
+    // only loaded when four lanes fit; later groups are 4-lane aligned and
+    // stop at `BLOCK`.
     unsafe {
+        if start >= BLOCK {
+            return None;
+        }
         let bias = _mm_set1_epi32(i32::MIN);
         let needle = _mm_xor_si128(_mm_set1_epi32(target as i32), bias);
         let mut i = start;
+        if (i & 3) != 0 && i + 4 <= BLOCK {
+            let hits = geq_lanes(block.as_ptr().add(i), needle, bias);
+            if hits != 0 {
+                return Some(i + hits.trailing_zeros() as usize);
+            }
+            i += 4;
+        }
+        while i < BLOCK && (i & 3) != 0 {
+            if block[i] >= target {
+                return Some(i);
+            }
+            i += 1;
+        }
         while i + 4 <= BLOCK {
             let hits = geq_lanes(block.as_ptr().add(i), needle, bias);
             if hits != 0 {
@@ -381,16 +398,7 @@ fn scan_geq_sse2(block: &[u32; BLOCK], start: usize, target: u32) -> Option<usiz
             }
             i += 4;
         }
-        if i >= BLOCK {
-            return None;
-        }
-        // Sorted, so a hit in a lane before `i` means `block[i]` is too.
-        let hits = geq_lanes(block.as_ptr().add(BLOCK - 4), needle, bias);
-        if hits == 0 {
-            return None;
-        }
-        let j = BLOCK - 4 + hits.trailing_zeros() as usize;
-        Some(j.max(i))
+        None
     }
 }
 
@@ -855,18 +863,16 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn scan_agrees_on_sorted_blocks() {
+    fn scan_agrees_on_random_blocks() {
         let mut rng = StdRng::seed_from_u64(11);
         let mut blocks = vec![
             [0u32; BLOCK],
             [u32::MAX; BLOCK],
             std::array::from_fn(|i| i as u32),
-            std::array::from_fn(|i| u32::MAX - (BLOCK - 1 - i) as u32),
+            std::array::from_fn(|i| u32::MAX - i as u32),
         ];
         for _ in 0..32 {
-            let mut block: [u32; BLOCK] = std::array::from_fn(|_| rng.random());
-            block.sort_unstable();
-            blocks.push(block);
+            blocks.push(std::array::from_fn(|_| rng.random()));
         }
         let targets = [0, 1, 2, 0x7fff_ffff, 0x8000_0000, u32::MAX, u32::MAX - 1];
         for block in &blocks {
@@ -879,8 +885,8 @@ pub(crate) mod tests {
                     );
                 }
             }
-            // Targets taken from the block, including lanes the tail group
-            // overlaps before `start`.
+            // Targets taken from the block, including lanes before an
+            // aligned group that the unaligned head must still see.
             for index in [0, 1, 3, 4, 124, 125, 126, 127] {
                 let target = block[index];
                 for start in 0..=index {
