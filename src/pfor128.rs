@@ -702,7 +702,48 @@ pub(crate) mod tests {
         cases.push((0..300).map(|i| u32::MAX - 299 + i).collect());
         cases.push(vec![0, u32::MAX]);
         cases.push(sorted_list(&mut rng, 5000, 1 << 20));
+        cases.push(mixed_blocks());
         cases
+    }
+
+    /// Gap-1 values of a block a bitset beats: eight gaps of 8 put the
+    /// packed width at 3 (49 bytes) while the span is 260 (33 body bytes).
+    /// The block's first id is its base plus 1.
+    pub(crate) fn dense_gaps() -> [u32; BLOCK] {
+        std::array::from_fn(|i| match i % 15 {
+            14 => 7,
+            0 | 3 | 6 | 9 | 12 => 0,
+            _ => 1,
+        })
+    }
+
+    /// The 128 ids of `gaps` after `prev` (`None` at the head of a list).
+    pub(crate) fn block_after(prev: Option<u32>, mut gaps: [u32; BLOCK]) -> Vec<u32> {
+        delta::decode(prev, &mut gaps);
+        gaps.to_vec()
+    }
+
+    /// A spiked gap so the block is not token `0`, strictly increasing.
+    pub(crate) fn patched_after(prev: u32) -> Vec<u32> {
+        let mut gaps = [0; BLOCK];
+        gaps[64] = 86_000 - 1;
+        block_after(Some(prev), gaps)
+    }
+
+    /// One block of every sorted kind — run, bitset, packed with exceptions,
+    /// bitset with a two-byte `first`, plain packed — then a tail. A sorted
+    /// list cannot produce a raw block: eight gaps of `2^29` overflow `u32`.
+    pub(crate) fn mixed_blocks() -> Vec<u32> {
+        let mut list: Vec<u32> = (0..BLOCK as u32).collect();
+        list.extend(block_after(list.last().copied(), dense_gaps()));
+        list.extend(patched_after(list[list.len() - 1]));
+        let mut far = dense_gaps();
+        far[0] = 299;
+        list.extend(block_after(list.last().copied(), far));
+        list.extend(block_after(list.last().copied(), [2; BLOCK]));
+        let last = list[list.len() - 1];
+        list.extend((1..=5).map(|i| last + i * 3));
+        list
     }
 
     /// Unsorted lists: the same shapes plus width-32 blocks.
@@ -770,9 +811,96 @@ pub(crate) mod tests {
         assert_eq!(buf, [0, 0]);
     }
 
-    fn values_from_gaps(mut gaps: [u32; BLOCK]) -> Vec<u32> {
-        delta::decode(None, &mut gaps);
-        gaps.to_vec()
+    fn values_from_gaps(gaps: [u32; BLOCK]) -> Vec<u32> {
+        block_after(None, gaps)
+    }
+
+    #[test]
+    fn dense_block_is_a_bitset() {
+        let list = values_from_gaps(dense_gaps());
+        assert_eq!(list[BLOCK - 1] - list[0], 260, "span");
+        let mut buf = Vec::new();
+        encode_sorted(&list, &mut buf);
+        // Token, `first` (gap-1 of id 0 from the head: one byte), 33 body bytes.
+        assert_eq!(&buf[..3], &[BITSET_TOKEN, 0, 33]);
+        assert_eq!(buf.len(), 1 + 1 + 1 + 33);
+        assert_eq!(buf[3] & 1, 1, "bit 0 is always set");
+        let mut back = Vec::new();
+        decode_sorted(list.len(), &buf, &mut back);
+        assert_eq!(back, list);
+
+        // The same ids with the last one moved past the span cap: packed,
+        // one width-4 exception, not a bitset.
+        let mut gaps = dense_gaps();
+        gaps[BLOCK - 1] = 3000;
+        let list = values_from_gaps(gaps);
+        let mut buf = Vec::new();
+        encode_sorted(&list, &mut buf);
+        assert_eq!(buf[0], (1 << 5) | 4);
+        assert_eq!(buf.len(), 1 + 2 + 4 * 16);
+        let mut back = Vec::new();
+        decode_sorted(list.len(), &buf, &mut back);
+        assert_eq!(back, list);
+    }
+
+    #[test]
+    fn tie_stays_packed_and_one_id_closer_is_a_bitset() {
+        // Eight gaps of 3, `twos` gaps of 2, the rest 1: width 2 with no
+        // exceptions packs to 33 bytes, and the bitset is 3 bytes plus a
+        // body of `span / 8 + 1`.
+        let block = |twos: usize| {
+            let mut gaps = [0; BLOCK];
+            gaps[1..9].fill(2);
+            gaps[9..9 + twos].fill(1);
+            values_from_gaps(gaps)
+        };
+        let tie = block(90);
+        assert_eq!(tie[BLOCK - 1] - tie[0], 233);
+        let mut buf = Vec::new();
+        encode_sorted(&tie, &mut buf);
+        assert_eq!(buf[0], 2, "width 2, no exceptions");
+        assert_eq!(buf.len(), 33);
+
+        let closer = block(88);
+        assert_eq!(closer[BLOCK - 1] - closer[0], 231);
+        let mut buf = Vec::new();
+        encode_sorted(&closer, &mut buf);
+        assert_eq!(&buf[..3], &[BITSET_TOKEN, 0, 29]);
+        assert_eq!(buf.len(), 32);
+        let mut back = Vec::new();
+        decode_sorted(closer.len(), &buf, &mut back);
+        assert_eq!(back, closer);
+    }
+
+    #[test]
+    fn bitset_first_is_the_gap_from_the_base() {
+        let list = mixed_blocks();
+        let mut buf = Vec::new();
+        encode_sorted(&list, &mut buf);
+        assert_eq!(buf[0], 0, "block 0 is a run");
+        // Block 1 follows id 127 at 128: gap-1 is 0. Block 3's first id is
+        // 300 past the end of block 2: a two-byte varint.
+        assert_eq!(&buf[1..4], &[BITSET_TOKEN, 0, 33]);
+        let b2 = 1 + block_len(&buf, 1);
+        assert_ne!(buf[b2] >> 5, 0, "block 2 has exceptions");
+        let b3 = b2 + block_len(&buf, b2);
+        assert_eq!(&buf[b3..b3 + 4], &[BITSET_TOKEN, 0xab, 0x02, 33]);
+        let b4 = b3 + block_len(&buf, b3);
+        assert_eq!(buf[b4], 2, "block 4 is plain packed");
+        assert_eq!(b4 + block_len(&buf, b4) + 5, buf.len(), "five tail bytes");
+        let mut back = Vec::new();
+        decode_sorted(list.len(), &buf, &mut back);
+        assert_eq!(back, list);
+    }
+
+    #[test]
+    fn seven_width_30_exceptions_escape_to_raw() {
+        // `0xfe` would be the token of this block; it is the bitset token.
+        let mut block = [1 << 29; BLOCK];
+        block[..7].fill(u32::MAX);
+        block[7] = 0;
+        let buf = check_unsorted_block(block);
+        assert_eq!(buf[0], RAW_TOKEN);
     }
 
     fn check_unsorted_block(block: [u32; BLOCK]) -> Vec<u8> {

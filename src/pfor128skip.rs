@@ -523,7 +523,10 @@ impl Cursor for SortedCursor<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pfor128::tests::{check_cursor, sorted_cases, unsorted_cases};
+    use crate::pfor128::tests::{
+        block_after, check_cursor, dense_gaps, mixed_blocks, patched_after, sorted_cases,
+        unsorted_cases,
+    };
 
     #[test]
     fn sorted_roundtrip() {
@@ -647,17 +650,6 @@ mod tests {
         assert_eq!(cursor.next(), None);
     }
 
-    /// A spiked gap so the block is not token `0`, strictly increasing.
-    fn patched_after(prev: u32) -> Vec<u32> {
-        let mut out = Vec::with_capacity(BLOCK);
-        let mut last = prev;
-        for i in 0..BLOCK {
-            last = if i == 64 { last + 86_000 } else { last + 1 };
-            out.push(last);
-        }
-        out
-    }
-
     #[test]
     fn one_run_block_plus_tail() {
         let list: Vec<u32> = (0..128 + 5).collect();
@@ -767,6 +759,127 @@ mod tests {
         assert_eq!(cursor.next_geq(u32::MAX), Some(u32::MAX), "last id");
         assert_eq!(cursor.unpacked, 0);
         assert_eq!(cursor.next(), None);
+    }
+
+    /// Index of the last id of block `b` of `list` whose bit sits in
+    /// word `word` of its bitset.
+    fn last_in_word(list: &[u32], b: usize, word: u32) -> usize {
+        let first = list[b * BLOCK];
+        (b * BLOCK..(b + 1) * BLOCK)
+            .rfind(|&i| (list[i] - first) / 64 == word)
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn bitset_seeks_land_by_word_operations() {
+        // Run, bitset, patched, bitset, packed, tail.
+        let list = mixed_blocks();
+        let mut buf = Vec::new();
+        encode_sorted(&list, &mut buf);
+        let table = Table::new(list.len(), &buf);
+        assert!(pfor128::is_bitset(buf[table.block_start(1)]));
+        assert!(pfor128::is_bitset(buf[table.block_start(3)]));
+        let first = list[BLOCK];
+        let last = list[2 * BLOCK - 1];
+
+        let mut cursor = SortedCursor::new(list.len(), &buf);
+        assert_eq!(cursor.next_geq(first), Some(first), "exactly `first`");
+        assert_eq!(cursor.unpacked, 0, "entering a bitset unpacks nothing");
+        // Between the last set bit of word 0 and the first of word 1.
+        let w0 = last_in_word(&list, 1, 0);
+        assert_eq!(cursor.next_geq(list[w0] + 1), Some(list[w0 + 1]));
+        assert_eq!(
+            cursor.next(),
+            Some(list[w0 + 2]),
+            "pos kept across the jump"
+        );
+        let w2 = last_in_word(&list, 1, 2);
+        assert_eq!(cursor.next_geq(list[w2]), Some(list[w2]), "a later word");
+        assert_eq!(cursor.next_geq(last), Some(last), "the last set bit");
+        assert_eq!(cursor.unpacked, 0);
+        assert_eq!(
+            cursor.next_geq(last + 1),
+            Some(list[2 * BLOCK]),
+            "past the block: the patched block"
+        );
+        assert_eq!(cursor.unpacked, 1);
+
+        // The second bitset, then out of it into the tail.
+        let first3 = list[3 * BLOCK];
+        let last3 = list[4 * BLOCK - 1];
+        assert_eq!(cursor.next_geq(first3), Some(first3));
+        assert_eq!(cursor.next_geq(last3 + 1), Some(list[4 * BLOCK]));
+        assert_eq!(cursor.unpacked, 2);
+        let tail = list[5 * BLOCK];
+        assert_eq!(cursor.next_geq(tail - 1), Some(tail));
+        assert_eq!(cursor.next_geq(u32::MAX), None);
+    }
+
+    #[test]
+    fn next_walks_a_bitset_across_words_and_out() {
+        let list = mixed_blocks();
+        let mut buf = Vec::new();
+        encode_sorted(&list, &mut buf);
+        let w0 = last_in_word(&list, 1, 0);
+        let mut cursor = SortedCursor::new(list.len(), &buf);
+        assert_eq!(cursor.next_geq(list[w0]), Some(list[w0]));
+        assert_eq!(cursor.next(), Some(list[w0 + 1]), "across a word boundary");
+        for &v in &list[w0 + 2..2 * BLOCK] {
+            assert_eq!(cursor.next(), Some(v));
+        }
+        assert_eq!(cursor.unpacked, 0);
+        assert_eq!(
+            cursor.next(),
+            Some(list[2 * BLOCK]),
+            "into the packed block"
+        );
+        assert_eq!(cursor.unpacked, 1);
+
+        // A bitset as the last block, walked into the tail.
+        let mut short: Vec<u32> = (0..BLOCK as u32).collect();
+        short.extend(block_after(short.last().copied(), dense_gaps()));
+        short.push(short[2 * BLOCK - 1] + 4);
+        let mut buf = Vec::new();
+        encode_sorted(&short, &mut buf);
+        let mut cursor = SortedCursor::new(short.len(), &buf);
+        assert_eq!(
+            cursor.next_geq(short[2 * BLOCK - 2]),
+            Some(short[2 * BLOCK - 2])
+        );
+        assert_eq!(cursor.next(), Some(short[2 * BLOCK - 1]));
+        assert_eq!(cursor.next(), Some(short[2 * BLOCK]), "tail");
+        assert_eq!(cursor.next(), None);
+        assert_eq!(cursor.unpacked, 0);
+    }
+
+    #[test]
+    fn bitset_seek_then_next_keeps_the_element_index() {
+        let list = mixed_blocks();
+        let mut buf = Vec::new();
+        encode_sorted(&list, &mut buf);
+        for b in [1, 3] {
+            for word in 0..5 {
+                let i = last_in_word(&list, b, word);
+                let mut cursor = SortedCursor::new(list.len(), &buf);
+                assert_eq!(cursor.next_geq(list[i]), Some(list[i]));
+                // The bits skipped by the jump are counted: `next` reaches
+                // the block boundary at the right element.
+                for &v in &list[i + 1..(b + 1) * BLOCK + 2] {
+                    assert_eq!(cursor.next(), Some(v), "block {b} word {word}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bitset_get_selects_the_bit() {
+        let list = mixed_blocks();
+        let mut buf = Vec::new();
+        encode_sorted(&list, &mut buf);
+        let middle = last_in_word(&list, 3, 2);
+        for i in [BLOCK, 2 * BLOCK - 1, 3 * BLOCK, middle, 4 * BLOCK - 1] {
+            assert_eq!(get_sorted(list.len(), &buf, i), list[i], "get({i})");
+        }
     }
 
     #[test]
