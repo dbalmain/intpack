@@ -90,6 +90,19 @@ pub fn unpack(width: u32, packed: &[u8], out: &mut [u32; BLOCK]) {
     scalar::unpack(width, packed, out);
 }
 
+/// [`unpack`], then add `bias` to every value.
+///
+/// The SIMD kernel adds before storing. A second pass over the block is a
+/// large fraction of decode on a long unsorted list. `bias` plus any unpacked
+/// lane must not wrap.
+pub fn unpack_add(width: u32, bias: u32, packed: &[u8], out: &mut [u32; BLOCK]) {
+    check(width, packed.len());
+    #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+    with_width!(width, simd::unpack_add(bias, packed, out));
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "sse2")))]
+    scalar::unpack_add(width, bias, packed, out);
+}
+
 /// [`width`] of the gaps of a strictly increasing `block`, `base` being the
 /// element before it (`None` at the head of a list), per the crate's delta
 /// convention.
@@ -170,6 +183,18 @@ mod tests {
                 let mut back = [0u32; BLOCK];
                 scalar::unpack(width, &packed, &mut back);
                 assert_eq!(back, block, "width {width}");
+                let max = block.iter().copied().fold(0, u32::max);
+                let bias = if max == u32::MAX {
+                    0
+                } else {
+                    rng.random_range(0..=u32::MAX - max)
+                };
+                let mut added = block;
+                for v in &mut added {
+                    *v += bias;
+                }
+                scalar::unpack_add(width, bias, &packed, &mut back);
+                assert_eq!(back, added, "unpack_add, width {width}");
             }
         }
     }
@@ -216,6 +241,18 @@ mod tests {
                 let mut back = [0u32; BLOCK];
                 unpack(width, &packed, &mut back);
                 assert_eq!(back, block, "unpack, width {width}");
+                let max = block.iter().copied().fold(0, u32::max);
+                let bias = if max == u32::MAX {
+                    0
+                } else {
+                    rng.random_range(0..=u32::MAX - max)
+                };
+                let mut added = block;
+                for v in &mut added {
+                    *v += bias;
+                }
+                unpack_add(width, bias, &packed, &mut back);
+                assert_eq!(back, added, "unpack_add, width {width}");
             }
             // Gaps narrower than 25 bits, so 128 of them plus a base fit in
             // a `u32` and the reference `delta::decode` cannot overflow.

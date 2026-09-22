@@ -59,6 +59,16 @@ pub fn unpack(width: u32, packed: &[u8], out: &mut [u32; BLOCK]) {
     }
 }
 
+/// [`unpack`](super::unpack), then add `bias`. `bias` plus any lane must not wrap.
+pub fn unpack_add(width: u32, bias: u32, packed: &[u8], out: &mut [u32; BLOCK]) {
+    unpack(width, packed, out);
+    if bias != 0 {
+        for v in out {
+            *v += bias;
+        }
+    }
+}
+
 // ── sorted blocks: the delta convention, then the same packing ──
 
 /// The gaps of a sorted block, per [`delta::gap`], `base` being the element

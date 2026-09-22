@@ -54,9 +54,24 @@ impl<'a> Table<'a> {
     }
 
     /// Where the tail starts in `buf`: just past the last block.
+    ///
+    /// Sorted blocks only. An unsorted block's frame-minimum varint is not in
+    /// [`pfor128::block_len`]; [`unsorted_tail_start`] counts it.
     fn tail_start(&self) -> usize {
         match self.blocks.checked_sub(1) {
             Some(b) => self.block_start(b) + pfor128::block_len(self.buf, self.block_start(b)),
+            None => 0,
+        }
+    }
+
+    /// Where the unsorted tail starts. The last block's length includes its
+    /// frame-minimum varint, which [`Self::tail_start`] does not count.
+    fn unsorted_tail_start(&self) -> usize {
+        match self.blocks.checked_sub(1) {
+            Some(b) => {
+                let start = self.block_start(b);
+                start + pfor128::block_len_unsorted(self.buf, start)
+            }
             None => 0,
         }
     }
@@ -197,7 +212,7 @@ pub fn get(n: usize, buf: &[u8], i: usize) -> u32 {
         pfor128::decode_block(buf, &mut table.block_start(b), &mut block);
         return block[i % BLOCK];
     }
-    let mut byte = table.tail_start();
+    let mut byte = table.unsorted_tail_start();
     let mut v = 0;
     for _ in 0..=i % BLOCK {
         v = vbyte::take(buf, &mut byte);
@@ -497,11 +512,14 @@ mod tests {
 
     #[test]
     fn raw_escapes_support_unsorted_get() {
+        // The second block keeps a zero so its minimum stays 0. Without that
+        // zero every value is >= 2^30 and the frame minimum packs the block.
         for mut block in [[0; BLOCK], [1 << 30; BLOCK]] {
             if block[7] == 0 {
                 block[..8].fill(u32::MAX);
             } else {
                 block[..7].fill(u32::MAX);
+                block[7] = 0;
             }
             let mut buf = Vec::new();
             encode(&block, &mut buf);

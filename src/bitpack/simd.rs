@@ -14,9 +14,9 @@
 //! reinterprets a reference to exactly the 16 bytes the vector holds.
 
 use core::arch::x86_64::{
-    __m128i, _mm_and_si128, _mm_cvtsi32_si128, _mm_loadu_si128, _mm_or_si128, _mm_set1_epi32,
-    _mm_setzero_si128, _mm_sll_epi32, _mm_slli_si128, _mm_srl_epi32, _mm_srli_si128,
-    _mm_storeu_si128, _mm_sub_epi32,
+    __m128i, _mm_add_epi32, _mm_and_si128, _mm_cvtsi32_si128, _mm_loadu_si128, _mm_or_si128,
+    _mm_set1_epi32, _mm_setzero_si128, _mm_sll_epi32, _mm_slli_si128, _mm_srl_epi32,
+    _mm_srli_si128, _mm_storeu_si128, _mm_sub_epi32,
 };
 
 use super::{BLOCK, mask};
@@ -152,6 +152,13 @@ fn pack_with<const W: u32>(block: &[u32; BLOCK], out: &mut [u8], mut emit: impl 
 #[target_feature(enable = "sse2")]
 pub fn unpack<const W: u32>(packed: &[u8], out: &mut [u32; BLOCK]) {
     unpack_with::<W>(packed, out, |v| v);
+}
+
+/// [`unpack`](super::unpack), adding `bias` in each lane before the store.
+#[target_feature(enable = "sse2")]
+pub fn unpack_add<const W: u32>(bias: u32, packed: &[u8], out: &mut [u32; BLOCK]) {
+    let bias = _mm_set1_epi32(bias as i32);
+    unpack_with::<W>(packed, out, |v| _mm_add_epi32(v, bias));
 }
 
 #[target_feature(enable = "sse2")]
