@@ -185,12 +185,7 @@ pub(crate) fn decode_block(buf: &[u8], byte: &mut usize, out: &mut [u32; BLOCK])
     let packed_len = bitpack::packed_len(width);
     let packed = &buf[*byte..*byte + packed_len];
     *byte += packed_len;
-    if exceptions == 0 && min == 0 {
-        bitpack::unpack(width, packed, out);
-    } else if exceptions == 0 && width == 0 {
-        // Every framed lane is zero: the block is the minimum.
-        out.fill(min);
-    } else if exceptions == 0 {
+    if exceptions == 0 {
         bitpack::unpack_add(width, min, packed, out);
     } else {
         bitpack::unpack(width, packed, out);
