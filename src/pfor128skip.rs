@@ -300,16 +300,23 @@ impl<'a> SortedCursor<'a> {
         }
     }
 
-    /// Enter block `b`. The check is here and the decode kept out of line so
-    /// the per-element callers inline it and pay a call only per block. A
-    /// zero token is one byte — width 0 packs to nothing and there are no
-    /// exceptions — and every gap is 0, so the ids are `first + j` with
-    /// `first` equal to `base + 1` (`0` when the block opens the list).
+    /// Enter block `b`. Only the check lives here, so the per-element callers
+    /// inline it and pay a call only per block; with the token dispatch in
+    /// the body LLVM stopped inlining it and `next()` paid the call on every
+    /// element, packed blocks included.
     #[inline]
     fn enter(&mut self, b: usize) {
-        if self.block_index() == Some(b) {
-            return;
+        if self.block_index() != Some(b) {
+            self.load(b);
         }
+    }
+
+    /// Load block `b`. A zero token is one byte — width 0 packs to nothing
+    /// and there are no exceptions — and every gap is 0, so the ids are
+    /// `first + j` with `first` equal to `base + 1` (`0` when the block opens
+    /// the list). A bitset block is read in place; anything else is decoded.
+    #[inline(never)]
+    fn load(&mut self, b: usize) {
         let mut at = self.table.block_start(b);
         let token = self.buf[at];
         if token == 0 {
@@ -324,22 +331,17 @@ impl<'a> SortedCursor<'a> {
             };
             self.block_last = self.table.last(b);
         } else {
-            self.unpack(b);
-        }
-    }
-
-    #[inline(never)]
-    fn unpack(&mut self, b: usize) {
-        self.block_last = pfor128::decode_block_sorted(
-            self.table.base(b),
-            self.buf,
-            &mut self.table.block_start(b),
-            &mut self.block,
-        );
-        self.loaded = Loaded::Values(b);
-        #[cfg(test)]
-        {
-            self.unpacked += 1;
+            self.block_last = pfor128::decode_block_sorted(
+                self.table.base(b),
+                self.buf,
+                &mut at,
+                &mut self.block,
+            );
+            self.loaded = Loaded::Values(b);
+            #[cfg(test)]
+            {
+                self.unpacked += 1;
+            }
         }
     }
 
