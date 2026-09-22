@@ -32,7 +32,7 @@
 //! [`pfor128skip`]: crate::pfor128skip
 
 use crate::bitpack::{self, BLOCK};
-use crate::{Cursor, delta, vbyte};
+use crate::{Cursor, bits, delta, vbyte};
 
 // ── blocks ──
 
@@ -365,38 +365,65 @@ impl<'a> Bitset<'a> {
         Some((at as u32 * 64 + word.trailing_zeros(), skipped))
     }
 
-    /// The `j`th id of the block: popcount to its word, then to its bit.
+    /// The `j`th id of the block: popcount to its word, then select in it.
     pub(crate) fn select(&self, j: usize) -> u32 {
-        let mut j = j as u32;
+        let mut j = j;
         for wi in 0..self.words() {
-            let mut word = self.word(wi);
-            let count = word.count_ones();
+            let word = self.word(wi);
+            let count = word.count_ones() as usize;
             if j < count {
-                for _ in 0..j {
-                    word &= word - 1;
-                }
-                return self.first + (wi as u32 * 64 + word.trailing_zeros());
+                return self.first + (wi as u32 * 64 + bits::select_one(word, j));
             }
             j -= count;
         }
         unreachable!("a bitset block holds {BLOCK} ids")
     }
 
-    /// All 128 ids, in order.
+    /// The last id of the block: the highest set bit.
+    pub(crate) fn last(&self) -> u32 {
+        let top = self.words() - 1;
+        self.first + (top as u32 * 64 + 63 - self.word(top).leading_zeros())
+    }
+
+    /// All 128 ids, in order. Each byte's set-bit positions come from a
+    /// table and are written eight lanes at a time, so there is no
+    /// per-bit dependency chain; the padded lanes are overwritten by the
+    /// next byte, and the scratch absorbs the final overrun.
     fn decode(&self, out: &mut [u32; BLOCK]) {
+        let mut scratch = [0; BLOCK + 8];
         let mut k = 0;
-        for wi in 0..self.words() {
-            let origin = wi as u32 * 64;
-            let mut word = self.word(wi);
-            while word != 0 {
-                out[k] = self.first + (origin + word.trailing_zeros());
-                word &= word - 1;
-                k += 1;
+        for (i, &byte) in self.body.iter().enumerate() {
+            let origin = self.first + i as u32 * 8;
+            let lanes = &mut scratch[k..k + 8];
+            for (lane, &bit) in lanes.iter_mut().zip(&BIT_POSITIONS[usize::from(byte)]) {
+                *lane = origin + u32::from(bit);
             }
+            k += byte.count_ones() as usize;
         }
         debug_assert_eq!(k, BLOCK);
+        out.copy_from_slice(&scratch[..BLOCK]);
     }
 }
+
+/// For each byte value, the positions of its set bits, lowest first, padded
+/// with zeros.
+const BIT_POSITIONS: [[u8; 8]; 256] = {
+    let mut table = [[0; 8]; 256];
+    let mut byte = 0;
+    while byte < 256 {
+        let mut lane = 0;
+        let mut bit = 0;
+        while bit < 8 {
+            if byte >> bit & 1 == 1 {
+                table[byte][lane] = bit as u8;
+                lane += 1;
+            }
+            bit += 1;
+        }
+        byte += 1;
+    }
+    table
+};
 
 /// Bytes the unsorted block at `buf[byte]` occupies, token and frame minimum included.
 pub(crate) fn block_len_unsorted(buf: &[u8], byte: usize) -> usize {
@@ -552,9 +579,22 @@ fn scan_geq_sse2(block: &[u32; BLOCK], start: usize, target: u32) -> Option<usiz
     }
 }
 
+/// The block the scan cursor is in. Only `Values` fills
+/// [`SortedCursor::block`].
+#[derive(Clone, Copy)]
+enum Entered<'a> {
+    /// `block` holds this block's ids.
+    Values,
+    /// Width-0 block: element `j` is `first + j`.
+    Run { first: u32 },
+    /// Bitset block, answered by word operations on its bytes in place.
+    Bits(Bitset<'a>),
+}
+
 /// Block-at-a-time cursor over a sorted list: unpacks each full block when
 /// the scan enters it, then reads the tail varint by varint. A width-0 block
-/// is 128 consecutive ids and is not unpacked.
+/// is 128 consecutive ids and is not unpacked; a bitset block is walked by
+/// word, and passed over by reading its last word.
 pub struct SortedCursor<'a> {
     buf: &'a [u8],
     n: usize,
@@ -563,9 +603,7 @@ pub struct SortedCursor<'a> {
     /// Where the next block, or the next tail varint, starts in `buf`.
     byte: usize,
     block: [u32; BLOCK],
-    /// `Some(first)` when the current block is a width-0 run — element `j`
-    /// is `first + j` — and `block` is stale.
-    run: Option<u32>,
+    entered: Entered<'a>,
     /// The current element, `None` before the first and after the last.
     cur: Option<u32>,
 }
@@ -580,23 +618,35 @@ impl<'a> SortedCursor<'a> {
             pos: 0,
             byte: 0,
             block: [0; BLOCK],
-            run: None,
+            entered: Entered::Values,
             cur: None,
         }
     }
 
-    /// Decode the block at `pos`, or record a width-0 run. A zero token is
-    /// one byte: width 0 packs to nothing and there are no exceptions, and
-    /// every gap is 0, so the ids are `first, first + 1, …` with `first`
-    /// being `cur + 1` (or `0` at the head of the list).
+    /// Decode the block at `pos`, or record a width-0 run or a bitset. A
+    /// zero token is one byte: width 0 packs to nothing and there are no
+    /// exceptions, and every gap is 0, so the ids are `first, first + 1, …`
+    /// with `first` being `cur + 1` (or `0` at the head of the list).
     fn enter_block(&mut self) {
-        if self.buf[self.byte] == 0 {
-            self.run = Some(delta::value(self.cur, 0));
+        let token = self.buf[self.byte];
+        self.entered = if token == 0 {
             self.byte += 1;
+            Entered::Run {
+                first: delta::value(self.cur, 0),
+            }
+        } else if token == BITSET_TOKEN {
+            Entered::Bits(Bitset::take(self.cur, self.buf, &mut self.byte))
         } else {
-            self.run = None;
             decode_block_sorted(self.cur, self.buf, &mut self.byte, &mut self.block);
-        }
+            Entered::Values
+        };
+    }
+
+    /// Position on element `j` of block `b`, whose id is `value`.
+    fn land(&mut self, b: usize, j: usize, value: u32) -> Option<u32> {
+        self.pos = b * BLOCK + j + 1;
+        self.cur = Some(value);
+        self.cur
     }
 }
 
@@ -614,29 +664,37 @@ impl Cursor for SortedCursor<'_> {
             if start == 0 {
                 self.enter_block();
             }
-            if let Some(first) = self.run {
-                let last = first + (BLOCK as u32 - 1);
-                if last < target {
-                    self.pos = (b + 1) * BLOCK;
-                    self.cur = Some(last);
-                    continue;
+            let last = match self.entered {
+                Entered::Run { first } => {
+                    let last = first + (BLOCK as u32 - 1);
+                    if target <= last {
+                        let j = if target <= first {
+                            start
+                        } else {
+                            ((target - first) as usize).max(start)
+                        };
+                        return self.land(b, j, first + j as u32);
+                    }
+                    last
                 }
-                let j = if target <= first {
-                    start
-                } else {
-                    ((target - first) as usize).max(start)
-                };
-                self.pos = b * BLOCK + j + 1;
-                self.cur = Some(first + j as u32);
-                return self.cur;
-            }
-            if let Some(j) = scan_geq(&self.block, start, target) {
-                self.pos = b * BLOCK + j + 1;
-                self.cur = Some(self.block[j]);
-                return self.cur;
-            }
+                Entered::Bits(bits) => {
+                    // Bits before `start` are already counted in `pos`.
+                    let from = self.cur.map_or(0, |c| (c + 1).saturating_sub(bits.first));
+                    let i = target.saturating_sub(bits.first).max(from);
+                    if let Some((bit, skipped)) = bits.next_set(from, i) {
+                        return self.land(b, start + skipped as usize, bits.first + bit);
+                    }
+                    bits.last()
+                }
+                Entered::Values => {
+                    if let Some(j) = scan_geq(&self.block, start, target) {
+                        return self.land(b, j, self.block[j]);
+                    }
+                    self.block[BLOCK - 1]
+                }
+            };
             self.pos = (b + 1) * BLOCK;
-            self.cur = Some(self.block[BLOCK - 1]);
+            self.cur = Some(last);
         }
         while let Some(v) = self.next() {
             if v >= target {
@@ -657,9 +715,21 @@ impl Cursor for SortedCursor<'_> {
             if self.pos.is_multiple_of(BLOCK) {
                 self.enter_block();
             }
-            match self.run {
-                Some(first) => first + (self.pos % BLOCK) as u32,
-                None => self.block[self.pos % BLOCK],
+            let j = self.pos % BLOCK;
+            match self.entered {
+                Entered::Run { first } => first + j as u32,
+                Entered::Values => self.block[j],
+                Entered::Bits(bits) => {
+                    let from = if j == 0 {
+                        0
+                    } else {
+                        self.cur.map_or(0, |c| c + 1 - bits.first)
+                    };
+                    match bits.next_set(from, from) {
+                        Some((bit, _)) => bits.first + bit,
+                        None => unreachable!("a bitset block holds {BLOCK} ids"),
+                    }
+                }
             }
         } else {
             delta::value(self.cur, vbyte::take(self.buf, &mut self.byte))
