@@ -222,11 +222,15 @@ pub fn get(n: usize, buf: &[u8], i: usize) -> u32 {
 
 // ── cursor ──
 
-/// Width-0 block: element `j` is `first + j`. The unpacked array is stale.
+/// What the cursor has entered. A run does not fill [`SortedCursor::block`].
 #[derive(Clone, Copy)]
-struct Run {
-    index: usize,
-    first: u32,
+enum Loaded {
+    /// No block yet.
+    None,
+    /// `block` holds this block's ids.
+    Values(usize),
+    /// Width-0 block: element `j` is `first + j`.
+    Run { index: usize, first: u32 },
 }
 
 /// Skip cursor over a sorted list. A target inside the value block already
@@ -242,21 +246,14 @@ pub struct SortedCursor<'a> {
     table: Table<'a>,
     /// Elements consumed so far; the current element is `pos - 1`.
     pos: usize,
-    /// `b * BLOCK` when [`Self::values`] is set.
-    origin: usize,
-    /// Last id of the unpacked block. The same-block test is
-    /// `target <= block_last`.
+    block: [u32; BLOCK],
+    loaded: Loaded,
+    /// Last id of `block` while `loaded` is `Values`.
     block_last: u32,
-    /// `block` holds the ids of the block at `origin`. Mutually exclusive
-    /// with [`Self::run`].
-    values: bool,
-    /// The current element, `None` before the first and after the last.
-    cur: Option<u32>,
-    /// Width-0 block currently entered.
-    run: Option<Run>,
     /// Where the next tail varint starts, once the tail has been entered.
     tail: Option<usize>,
-    block: [u32; BLOCK],
+    /// The current element, `None` before the first and after the last.
+    cur: Option<u32>,
     #[cfg(test)]
     unpacked: usize,
     /// Times the slow path consulted the skip table.
@@ -273,17 +270,22 @@ impl<'a> SortedCursor<'a> {
             n,
             table: Table::new(n, buf),
             pos: 0,
-            origin: 0,
-            block_last: 0,
-            values: false,
-            cur: None,
-            run: None,
-            tail: None,
             block: [0; BLOCK],
+            loaded: Loaded::None,
+            block_last: 0,
+            tail: None,
+            cur: None,
             #[cfg(test)]
             unpacked: 0,
             #[cfg(test)]
             searched: 0,
+        }
+    }
+
+    fn block_index(&self) -> Option<usize> {
+        match self.loaded {
+            Loaded::None => None,
+            Loaded::Values(b) | Loaded::Run { index: b, .. } => Some(b),
         }
     }
 
@@ -294,20 +296,15 @@ impl<'a> SortedCursor<'a> {
     /// `first` equal to `base + 1` (`0` when the block opens the list).
     #[inline]
     fn enter(&mut self, b: usize) {
-        if self.values && self.origin == b * BLOCK {
-            return;
-        }
-        if self.run.as_ref().is_some_and(|r| r.index == b) {
+        if self.block_index() == Some(b) {
             return;
         }
         let at = self.table.block_start(b);
         if self.buf[at] == 0 {
-            // A run has no unpacked block, so the same-block test must miss.
-            self.values = false;
-            self.run = Some(Run {
+            self.loaded = Loaded::Run {
                 index: b,
                 first: delta::value(self.table.base(b), 0),
-            });
+            };
             return;
         }
         self.unpack(b);
@@ -321,9 +318,7 @@ impl<'a> SortedCursor<'a> {
             &mut self.table.block_start(b),
             &mut self.block,
         );
-        self.origin = b * BLOCK;
-        self.values = true;
-        self.run = None;
+        self.loaded = Loaded::Values(b);
         #[cfg(test)]
         {
             self.unpacked += 1;
@@ -332,10 +327,10 @@ impl<'a> SortedCursor<'a> {
 
     #[inline]
     fn value_at(&self, j: usize) -> u32 {
-        match self.run {
-            Some(run) => run.first + j as u32,
-            None if self.values => self.block[j],
-            None => unreachable!("enter loads a block before it is read"),
+        match self.loaded {
+            Loaded::Run { first, .. } => first + j as u32,
+            Loaded::Values(_) => self.block[j],
+            Loaded::None => unreachable!("enter loads a block before it is read"),
         }
     }
 
@@ -345,8 +340,6 @@ impl<'a> SortedCursor<'a> {
         self.pos = self.table.blocks * BLOCK;
         self.cur = self.table.base(self.table.blocks);
         self.tail = Some(self.table.tail_start());
-        self.values = false;
-        self.run = None;
     }
 
     /// Scan the tail, already entered, for the first value `>= target`.
@@ -369,15 +362,15 @@ impl<'a> SortedCursor<'a> {
         self.cur
     }
 
-    /// First id at or after `pos` in the unpacked block. `target` is past the
-    /// current id and at most [`Self::block_last`], so the hit is in this block.
+    /// First id at or after `pos` in the unpacked block `b`. `target` is past
+    /// the current id and at most [`Self::block_last`], so the hit is here.
     #[inline]
-    fn scan_loaded(&mut self, target: u32) -> Option<u32> {
-        let start = self.pos - self.origin;
-        let Some(j) = pfor128::scan_geq(&self.block, start, target) else {
+    fn scan_loaded(&mut self, b: usize, target: u32) -> Option<u32> {
+        let origin = b * BLOCK;
+        let Some(j) = pfor128::scan_geq(&self.block, self.pos - origin, target) else {
             unreachable!("block ending at {} holds {target}", self.block_last);
         };
-        self.pos = self.origin + j + 1;
+        self.pos = origin + j + 1;
         self.cur = Some(self.block[j]);
         self.cur
     }
@@ -386,12 +379,12 @@ impl<'a> SortedCursor<'a> {
     /// same-block advance does not carry the search.
     #[inline(never)]
     fn search(&mut self, target: u32) -> Option<u32> {
-        if self.tail.is_some() {
-            return self.scan_tail(target);
-        }
         #[cfg(test)]
         {
             self.searched += 1;
+        }
+        if self.tail.is_some() {
+            return self.scan_tail(target);
         }
         // Targets never decrease, so the search starts at the current block.
         let from = self.pos.saturating_sub(1) / BLOCK;
@@ -402,11 +395,11 @@ impl<'a> SortedCursor<'a> {
         }
         self.enter(b);
         let start = if b == from { self.pos % BLOCK } else { 0 };
-        let j = if let Some(run) = self.run {
-            let j = if target <= run.first {
+        let j = if let Loaded::Run { first, .. } = self.loaded {
+            let j = if target <= first {
                 0
             } else {
-                (target - run.first) as usize
+                (target - first) as usize
             };
             let j = j.max(start);
             if j >= BLOCK {
@@ -432,16 +425,15 @@ impl Cursor for SortedCursor<'_> {
         {
             return Some(cur);
         }
-        // `pos == n` is the element past the end (the last id, if any, was
-        // the early-out above). A value block stays `values` after `next`
-        // exhausts a block-aligned list; don't scan it again.
+        // `next` past the end of a block-aligned list leaves its last block
+        // loaded with `cur` clear; there is nothing left to scan.
         if self.pos == self.n {
             return None;
         }
-        // Inside the unpacked block the table already said yes: its last id
-        // is `block_last`. Runs and the tail have `values` clear.
-        if self.values && target <= self.block_last {
-            return self.scan_loaded(target);
+        if let Loaded::Values(b) = self.loaded
+            && target <= self.block_last
+        {
+            return self.scan_loaded(b, target);
         }
         self.search(target)
     }
@@ -721,6 +713,72 @@ mod tests {
     }
 
     #[test]
+    fn gallop_lands_on_block_ends_and_past_the_list() {
+        let mut list: Vec<u32> = (0..128 * 16).map(|i| i * 3 + 10).collect();
+        let tail = list[list.len() - 1] + 5;
+        list.push(tail);
+        list.push(tail + 9);
+        let mut buf = Vec::new();
+        encode_sorted(&list, &mut buf);
+
+        // Block 1, then several blocks ahead: the gallop, not the block-0 search.
+        let mut cursor = SortedCursor::new(list.len(), &buf);
+        assert_eq!(cursor.next_geq(list[128]), Some(list[128]));
+        assert_eq!(
+            cursor.next_geq(list[10 * 128]),
+            Some(list[10 * 128]),
+            "first"
+        );
+        assert_eq!(
+            cursor.next_geq(list[10 * 128 + 127]),
+            Some(list[10 * 128 + 127]),
+            "last"
+        );
+
+        let mut fresh = SortedCursor::new(list.len(), &buf);
+        assert_eq!(fresh.next_geq(list[6 * 128]), Some(list[6 * 128]));
+        let mut fresh = SortedCursor::new(list.len(), &buf);
+        assert_eq!(
+            fresh.next_geq(list[6 * 128 + 127]),
+            Some(list[6 * 128 + 127])
+        );
+        assert_eq!(fresh.next_geq(tail), Some(tail), "tail");
+        assert_eq!(fresh.next_geq(tail + 9), Some(tail + 9));
+        assert_eq!(fresh.next_geq(tail + 10), None, "past the list");
+    }
+
+    #[test]
+    fn gallop_agrees_with_a_binary_search() {
+        let list: Vec<u32> = (0..128 * 20 + 3).map(|i| i * 5 + 1).collect();
+        let mut buf = Vec::new();
+        encode_sorted(&list, &mut buf);
+        let table = Table::new(list.len(), &buf);
+        let binary = |from: usize, target: u32| {
+            let (mut lo, mut hi) = (from, table.blocks);
+            while lo < hi {
+                let mid = lo + (hi - lo) / 2;
+                if table.last(mid) < target {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
+            }
+            lo
+        };
+        for from in 0..=table.blocks {
+            assert_eq!(table.find(from, 0), binary(from, 0), "from {from}");
+            assert_eq!(table.find(from, u32::MAX), binary(from, u32::MAX));
+            for b in from..table.blocks {
+                let last = table.last(b);
+                assert_eq!(table.find(from, last), binary(from, last), "block {b}");
+                if last < u32::MAX {
+                    assert_eq!(table.find(from, last + 1), binary(from, last + 1));
+                }
+            }
+        }
+    }
+
+    #[test]
     fn same_block_last_value_does_not_search() {
         let mut list = patched_after(0);
         let last0 = list[BLOCK - 1];
@@ -789,71 +847,5 @@ mod tests {
         while done.next().is_some() {}
         assert_eq!(done.next_geq(list[0]), None, "exhausted value block");
         assert_eq!(done.next_geq(last0), None);
-    }
-
-    #[test]
-    fn gallop_lands_on_block_ends_and_past_the_list() {
-        let mut list: Vec<u32> = (0..128 * 16).map(|i| i * 3 + 10).collect();
-        let tail = list[list.len() - 1] + 5;
-        list.push(tail);
-        list.push(tail + 9);
-        let mut buf = Vec::new();
-        encode_sorted(&list, &mut buf);
-
-        // Block 1, then several blocks ahead: the gallop, not the block-0 search.
-        let mut cursor = SortedCursor::new(list.len(), &buf);
-        assert_eq!(cursor.next_geq(list[128]), Some(list[128]));
-        assert_eq!(
-            cursor.next_geq(list[10 * 128]),
-            Some(list[10 * 128]),
-            "first"
-        );
-        assert_eq!(
-            cursor.next_geq(list[10 * 128 + 127]),
-            Some(list[10 * 128 + 127]),
-            "last"
-        );
-
-        let mut fresh = SortedCursor::new(list.len(), &buf);
-        assert_eq!(fresh.next_geq(list[6 * 128]), Some(list[6 * 128]));
-        let mut fresh = SortedCursor::new(list.len(), &buf);
-        assert_eq!(
-            fresh.next_geq(list[6 * 128 + 127]),
-            Some(list[6 * 128 + 127])
-        );
-        assert_eq!(fresh.next_geq(tail), Some(tail), "tail");
-        assert_eq!(fresh.next_geq(tail + 9), Some(tail + 9));
-        assert_eq!(fresh.next_geq(tail + 10), None, "past the list");
-    }
-
-    #[test]
-    fn gallop_agrees_with_a_binary_search() {
-        let list: Vec<u32> = (0..128 * 20 + 3).map(|i| i * 5 + 1).collect();
-        let mut buf = Vec::new();
-        encode_sorted(&list, &mut buf);
-        let table = Table::new(list.len(), &buf);
-        let binary = |from: usize, target: u32| {
-            let (mut lo, mut hi) = (from, table.blocks);
-            while lo < hi {
-                let mid = lo + (hi - lo) / 2;
-                if table.last(mid) < target {
-                    lo = mid + 1;
-                } else {
-                    hi = mid;
-                }
-            }
-            lo
-        };
-        for from in 0..=table.blocks {
-            assert_eq!(table.find(from, 0), binary(from, 0), "from {from}");
-            assert_eq!(table.find(from, u32::MAX), binary(from, u32::MAX));
-            for b in from..table.blocks {
-                let last = table.last(b);
-                assert_eq!(table.find(from, last), binary(from, last), "block {b}");
-                if last < u32::MAX {
-                    assert_eq!(table.find(from, last + 1), binary(from, last + 1));
-                }
-            }
-        }
     }
 }
