@@ -38,6 +38,9 @@ use crate::{Cursor, delta, vbyte};
 
 const MAX_EXCEPTIONS: usize = 7;
 const RAW_TOKEN: u8 = u8::MAX;
+const BITSET_TOKEN: u8 = u8::MAX - 1;
+/// Widest `last - first` a bitset block may cover: its body is at most 255 bytes.
+const BITSET_MAX_SPAN: u32 = 255 * 8 - 1;
 
 const fn low_mask(width: u32) -> u32 {
     ((1u64 << width) - 1) as u32
@@ -61,8 +64,41 @@ fn patched_width(block: &[u32; BLOCK]) -> (u32, usize) {
     (width, exceptions)
 }
 
+/// Tokens `0xff` and `0xfe` are taken, so a block that would use either
+/// goes raw: seven exceptions at width 30 or 31 are gaps near `2^30`.
 fn raw_escape(width: u32, exceptions: usize) -> bool {
-    width == 32 || (width == 31 && exceptions == MAX_EXCEPTIONS)
+    width == 32 || (width >= 30 && exceptions == MAX_EXCEPTIONS)
+}
+
+/// Bytes of a patched block: token, exception pairs, packed lows.
+fn patched_bytes(width: u32, exceptions: usize) -> usize {
+    1 + 2 * exceptions + bitpack::packed_len(width)
+}
+
+/// Body bytes of a bitset over `block`, `None` when it spans too far.
+fn bitset_body_len(block: &[u32; BLOCK]) -> Option<usize> {
+    let span = block[BLOCK - 1] - block[0];
+    (span <= BITSET_MAX_SPAN).then(|| span as usize / 8 + 1)
+}
+
+/// Bytes of a bitset block: token, `first` varint, body length, body.
+fn bitset_bytes(first: u32, body_len: usize) -> usize {
+    1 + bits_required(first).max(1).div_ceil(7) as usize + 1 + body_len
+}
+
+/// Token, `first`, body length, then the body: bit `v - block[0]` set for
+/// each `v` in `block`.
+fn write_bitset(first: u32, body_len: usize, block: &[u32; BLOCK], out: &mut Vec<u8>) {
+    out.push(BITSET_TOKEN);
+    vbyte::put(first, out);
+    out.push(body_len as u8);
+    let start = out.len();
+    out.resize(start + body_len, 0);
+    let body = &mut out[start..];
+    for &v in block {
+        let bit = (v - block[0]) as usize;
+        body[bit / 8] |= 1 << (bit % 8);
+    }
 }
 
 fn write_raw(block: &[u32; BLOCK], out: &mut Vec<u8>) {
@@ -87,17 +123,6 @@ fn write_patched(block: &[u32; BLOCK], width: u32, out: &mut Vec<u8>) {
     bitpack::pack(width, &lows, &mut out[start..]);
 }
 
-/// Sorted blocks: patch and pack `block` as given. No frame minimum.
-fn encode_values(block: &[u32; BLOCK], out: &mut Vec<u8>) {
-    let (width, exceptions) = patched_width(block);
-    if raw_escape(width, exceptions) {
-        write_raw(block, out);
-        return;
-    }
-    out.push(((exceptions as u8) << 5) | width as u8);
-    write_patched(block, width, out);
-}
-
 fn block_min(block: &[u32; BLOCK]) -> u32 {
     block.iter().copied().fold(u32::MAX, u32::min)
 }
@@ -105,6 +130,10 @@ fn block_min(block: &[u32; BLOCK]) -> u32 {
 /// Encode one full block of a sorted list, gaps relative to `base` (the
 /// previous block's last value, `None` for the first block). Returns the
 /// block's last value, the next block's base.
+///
+/// A bitset is chosen only when it is strictly smaller than the patched
+/// block, so a dense block that ties stays packed on the fused
+/// `unpack_sorted` path; a width-0 run is one byte and always wins.
 pub(crate) fn encode_block_sorted(
     base: Option<u32>,
     block: &[u32; BLOCK],
@@ -116,7 +145,17 @@ pub(crate) fn encode_block_sorted(
         *gap = delta::gap(prev, v);
         prev = Some(v);
     }
-    encode_values(&gaps, out);
+    let (width, exceptions) = patched_width(&gaps);
+    if raw_escape(width, exceptions) {
+        write_raw(&gaps, out);
+    } else if let Some(body_len) = bitset_body_len(block)
+        && bitset_bytes(gaps[0], body_len) < patched_bytes(width, exceptions)
+    {
+        write_bitset(gaps[0], body_len, block, out);
+    } else {
+        out.push(((exceptions as u8) << 5) | width as u8);
+        write_patched(&gaps, width, out);
+    }
     block[BLOCK - 1]
 }
 
@@ -152,6 +191,8 @@ pub(crate) fn decode_block_sorted(
     if token == RAW_TOKEN {
         take_raw(buf, byte, out);
         delta::decode(base, out);
+    } else if token == BITSET_TOKEN {
+        Bitset::take(base, buf, byte).decode(out);
     } else {
         let exceptions = usize::from(token >> 5);
         let width = u32::from(token & 0x1f);
@@ -235,8 +276,125 @@ pub(crate) fn block_len(buf: &[u8], byte: usize) -> usize {
     let token = buf[byte];
     if token == RAW_TOKEN {
         1 + BLOCK * size_of::<u32>()
+    } else if token == BITSET_TOKEN {
+        let mut pos = byte + 1;
+        vbyte::take(buf, &mut pos);
+        pos + 1 + usize::from(buf[pos]) - byte
     } else {
-        1 + usize::from(token >> 5) * 2 + bitpack::packed_len(u32::from(token & 0x1f))
+        patched_bytes(u32::from(token & 0x1f), usize::from(token >> 5))
+    }
+}
+
+// ── bitset blocks ──
+
+/// Whether the sorted block with this token is a bitset.
+#[inline]
+pub(crate) fn is_bitset(token: u8) -> bool {
+    token == BITSET_TOKEN
+}
+
+/// A bitset block in place: bit `i` of `body`, little-endian, is set iff
+/// `first + i` is in the list, and bit 0 always is. The body is read as
+/// `u64` words on the fly; it is not aligned in `buf` and its last word is
+/// padded with zeros.
+#[derive(Clone, Copy)]
+pub(crate) struct Bitset<'a> {
+    /// The block's first id.
+    pub(crate) first: u32,
+    body: &'a [u8],
+}
+
+impl<'a> Bitset<'a> {
+    /// The block at `buf[*byte]`, whose token is [`BITSET_TOKEN`], advancing
+    /// `*byte` past it.
+    pub(crate) fn take(base: Option<u32>, buf: &'a [u8], byte: &mut usize) -> Self {
+        *byte += 1;
+        let first = delta::value(base, vbyte::take(buf, byte));
+        let len = usize::from(buf[*byte]);
+        *byte += 1;
+        let body = &buf[*byte..*byte + len];
+        *byte += len;
+        Self { first, body }
+    }
+
+    fn words(&self) -> usize {
+        self.body.len().div_ceil(8)
+    }
+
+    #[inline]
+    fn word(&self, i: usize) -> u64 {
+        let rest = &self.body[i * 8..];
+        match rest.first_chunk::<8>() {
+            Some(word) => u64::from_le_bytes(*word),
+            None => {
+                let mut word = [0; 8];
+                word[..rest.len()].copy_from_slice(rest);
+                u64::from_le_bytes(word)
+            }
+        }
+    }
+
+    /// The first set bit at or after bit `i`, with the number of set bits in
+    /// `from..bit` (`from <= i`) so a cursor can keep its element index;
+    /// `None` when no bit at or after `i` is set.
+    #[inline]
+    pub(crate) fn next_set(&self, from: u32, i: u32) -> Option<(u32, u32)> {
+        let words = self.words();
+        let mut at = (i / 64) as usize;
+        if at >= words {
+            return None;
+        }
+        let mut wi = (from / 64) as usize;
+        let mut word = self.word(wi) & (u64::MAX << (from % 64));
+        let mut skipped = 0;
+        while wi < at {
+            skipped += word.count_ones();
+            wi += 1;
+            word = self.word(wi);
+        }
+        let from_i = u64::MAX << (i % 64);
+        skipped += (word & !from_i).count_ones();
+        word &= from_i;
+        while word == 0 {
+            at += 1;
+            if at == words {
+                return None;
+            }
+            word = self.word(at);
+        }
+        Some((at as u32 * 64 + word.trailing_zeros(), skipped))
+    }
+
+    /// The `j`th id of the block: popcount to its word, then to its bit.
+    pub(crate) fn select(&self, j: usize) -> u32 {
+        let mut j = j as u32;
+        for wi in 0..self.words() {
+            let mut word = self.word(wi);
+            let count = word.count_ones();
+            if j < count {
+                for _ in 0..j {
+                    word &= word - 1;
+                }
+                return self.first + (wi as u32 * 64 + word.trailing_zeros());
+            }
+            j -= count;
+        }
+        unreachable!("a bitset block holds {BLOCK} ids")
+    }
+
+    /// All 128 ids, in order.
+    fn decode(&self, out: &mut [u32; BLOCK]) {
+        let mut k = 0;
+        for wi in 0..self.words() {
+            let origin = wi as u32 * 64;
+            let mut word = self.word(wi);
+            while word != 0 {
+                out[k] = self.first + (origin + word.trailing_zeros());
+                word &= word - 1;
+                k += 1;
+            }
+        }
+        debug_assert_eq!(k, BLOCK);
     }
 }
 

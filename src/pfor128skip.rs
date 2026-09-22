@@ -12,7 +12,7 @@
 //! [`pfor128`]: crate::pfor128
 
 use crate::bitpack::BLOCK;
-use crate::pfor128;
+use crate::pfor128::{self, Bitset};
 use crate::{Cursor, delta, vbyte};
 
 /// Bytes of skip table in front of the payload of an `n`-element list.
@@ -190,8 +190,12 @@ pub fn get_sorted(n: usize, buf: &[u8], i: usize) -> u32 {
     let table = Table::new(n, buf);
     let b = i / BLOCK;
     if b < table.blocks {
+        let mut at = table.block_start(b);
+        if pfor128::is_bitset(buf[at]) {
+            return Bitset::take(table.base(b), buf, &mut at).select(i % BLOCK);
+        }
         let mut block = [0; BLOCK];
-        pfor128::decode_block_sorted(table.base(b), buf, &mut table.block_start(b), &mut block);
+        pfor128::decode_block_sorted(table.base(b), buf, &mut at, &mut block);
         return block[i % BLOCK];
     }
     let mut byte = table.tail_start();
@@ -222,24 +226,27 @@ pub fn get(n: usize, buf: &[u8], i: usize) -> u32 {
 
 // ── cursor ──
 
-/// What the cursor has entered. A run does not fill [`SortedCursor::block`].
+/// What the cursor has entered. Only `Values` fills [`SortedCursor::block`].
 #[derive(Clone, Copy)]
-enum Loaded {
+enum Loaded<'a> {
     /// No block yet.
     None,
     /// `block` holds this block's ids.
     Values(usize),
     /// Width-0 block: element `j` is `first + j`.
     Run { index: usize, first: u32 },
+    /// Bitset block, answered by word operations on its bytes in place.
+    Bits { index: usize, bits: Bitset<'a> },
 }
 
-/// Skip cursor over a sorted list. A target inside the value block already
-/// unpacked compares against that block's last id and scans — no skip-table
-/// read. Anything else finds a block in the table (current block first, then
-/// a gallop, or a binary search when that starts at block 0) and unpacks only
-/// the block it lands in. A block whose token is `0` is 128 consecutive ids
-/// and is answered from the table's base. The tail is entered from the
-/// table's last entry.
+/// Skip cursor over a sorted list. A target inside the value or bitset
+/// block already entered compares against that block's last id and scans it
+/// — no skip-table read. Anything else finds a block in the table (current
+/// block first, then a gallop, or a binary search when that starts at block
+/// 0) and unpacks only the block it lands in. A block whose token is `0` is
+/// 128 consecutive ids and is answered from the table's base; a bitset block
+/// is answered from its words in place. The tail is entered from the table's
+/// last entry.
 pub struct SortedCursor<'a> {
     buf: &'a [u8],
     n: usize,
@@ -247,8 +254,8 @@ pub struct SortedCursor<'a> {
     /// Elements consumed so far; the current element is `pos - 1`.
     pos: usize,
     block: [u32; BLOCK],
-    loaded: Loaded,
-    /// Last id of `block` while `loaded` is `Values`.
+    loaded: Loaded<'a>,
+    /// Last id of the block while `loaded` is `Values` or `Bits`.
     block_last: u32,
     /// Where the next tail varint starts, once the tail has been entered.
     tail: Option<usize>,
@@ -285,7 +292,9 @@ impl<'a> SortedCursor<'a> {
     fn block_index(&self) -> Option<usize> {
         match self.loaded {
             Loaded::None => None,
-            Loaded::Values(b) | Loaded::Run { index: b, .. } => Some(b),
+            Loaded::Values(b) | Loaded::Run { index: b, .. } | Loaded::Bits { index: b, .. } => {
+                Some(b)
+            }
         }
     }
 
@@ -299,15 +308,22 @@ impl<'a> SortedCursor<'a> {
         if self.block_index() == Some(b) {
             return;
         }
-        let at = self.table.block_start(b);
-        if self.buf[at] == 0 {
+        let mut at = self.table.block_start(b);
+        let token = self.buf[at];
+        if token == 0 {
             self.loaded = Loaded::Run {
                 index: b,
                 first: delta::value(self.table.base(b), 0),
             };
-            return;
+        } else if pfor128::is_bitset(token) {
+            self.loaded = Loaded::Bits {
+                index: b,
+                bits: Bitset::take(self.table.base(b), self.buf, &mut at),
+            };
+            self.block_last = self.table.last(b);
+        } else {
+            self.unpack(b);
         }
-        self.unpack(b);
     }
 
     #[inline(never)]
@@ -325,13 +341,43 @@ impl<'a> SortedCursor<'a> {
         }
     }
 
+    /// Element `j` of the loaded block. On a bitset block `j` is the current
+    /// element's successor: the walk starts at the bit after `cur`, or at
+    /// bit 0 when the block was just entered.
     #[inline]
     fn value_at(&self, j: usize) -> u32 {
         match self.loaded {
             Loaded::Run { first, .. } => first + j as u32,
             Loaded::Values(_) => self.block[j],
+            Loaded::Bits { bits, .. } => {
+                let from = if j == 0 {
+                    0
+                } else {
+                    self.cur.map_or(0, |c| c + 1 - bits.first)
+                };
+                match bits.next_set(from, from) {
+                    Some((bit, _)) => bits.first + bit,
+                    None => unreachable!("a bitset block holds {BLOCK} ids"),
+                }
+            }
             Loaded::None => unreachable!("enter loads a block before it is read"),
         }
+    }
+
+    /// First id `>= target` in the entered bitset block `b`, whose ids
+    /// before `cur` are already counted in `pos`; the walk starts at the bit
+    /// after `cur`, or at bit 0 when the block was just entered. `target` is
+    /// at most [`Self::block_last`], so the hit is here.
+    #[inline]
+    fn seek_bits(&mut self, bits: Bitset<'a>, target: u32) -> Option<u32> {
+        let from = self.cur.map_or(0, |c| (c + 1).saturating_sub(bits.first));
+        let i = target.saturating_sub(bits.first).max(from);
+        let Some((bit, skipped)) = bits.next_set(from, i) else {
+            unreachable!("block ending at {} holds {target}", self.block_last);
+        };
+        self.pos += skipped as usize + 1;
+        self.cur = Some(bits.first + bit);
+        self.cur
     }
 
     /// Position at the end of the last full block, ready to read the tail;
@@ -395,21 +441,30 @@ impl<'a> SortedCursor<'a> {
         }
         self.enter(b);
         let start = if b == from { self.pos % BLOCK } else { 0 };
-        let j = if let Loaded::Run { first, .. } = self.loaded {
-            let j = if target <= first {
-                0
-            } else {
-                (target - first) as usize
-            };
-            let j = j.max(start);
-            if j >= BLOCK {
-                unreachable!("block {b} ends at or past {target}");
+        let j = match self.loaded {
+            Loaded::Run { first, .. } => {
+                let j = if target <= first {
+                    0
+                } else {
+                    (target - first) as usize
+                };
+                let j = j.max(start);
+                if j >= BLOCK {
+                    unreachable!("block {b} ends at or past {target}");
+                }
+                j
             }
-            j
-        } else {
-            match pfor128::scan_geq(&self.block, start, target) {
-                Some(j) => j,
-                None => unreachable!("block {b} ends at or past {target}"),
+            Loaded::Bits { bits, .. } => {
+                if b != from {
+                    self.pos = b * BLOCK;
+                }
+                return self.seek_bits(bits, target);
+            }
+            Loaded::Values(_) | Loaded::None => {
+                match pfor128::scan_geq(&self.block, start, target) {
+                    Some(j) => j,
+                    None => unreachable!("block {b} ends at or past {target}"),
+                }
             }
         };
         self.pos = b * BLOCK + j + 1;
@@ -430,10 +485,12 @@ impl Cursor for SortedCursor<'_> {
         if self.pos == self.n {
             return None;
         }
-        if let Loaded::Values(b) = self.loaded
-            && target <= self.block_last
-        {
-            return self.scan_loaded(b, target);
+        match self.loaded {
+            Loaded::Values(b) if target <= self.block_last => return self.scan_loaded(b, target),
+            Loaded::Bits { bits, .. } if target <= self.block_last => {
+                return self.seek_bits(bits, target);
+            }
+            _ => {}
         }
         self.search(target)
     }
