@@ -347,8 +347,10 @@ impl<'a> SortedCursor<'a> {
 
     /// Element `j` of the loaded block. On a bitset block `j` is the current
     /// element's successor: the walk starts at the bit after `cur`, or at
-    /// bit 0 when the block was just entered.
-    #[inline]
+    /// bit 0 when the block was just entered. Forced inline: `next()` is a
+    /// per-element call and LLVM drops this out of line once the bitset walk
+    /// is in it, which costs more than the walk.
+    #[inline(always)]
     fn value_at(&self, j: usize) -> u32 {
         match self.loaded {
             Loaded::Run { first, .. } => first + j as u32,
@@ -359,10 +361,7 @@ impl<'a> SortedCursor<'a> {
                 } else {
                     self.cur.map_or(0, |c| c + 1 - bits.first)
                 };
-                match bits.next_set(from, from) {
-                    Some((bit, _)) => bits.first + bit,
-                    None => unreachable!("a bitset block holds {BLOCK} ids"),
-                }
+                bits.first + bits.successor(from)
             }
             Loaded::None => unreachable!("enter loads a block before it is read"),
         }

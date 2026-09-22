@@ -337,12 +337,33 @@ impl<'a> Bitset<'a> {
         let rest = &self.body[i * 8..];
         match rest.first_chunk::<8>() {
             Some(word) => u64::from_le_bytes(*word),
-            None => {
-                let mut word = [0; 8];
-                word[..rest.len()].copy_from_slice(rest);
-                u64::from_le_bytes(word)
-            }
+            None => Self::tail_word(rest),
         }
+    }
+
+    /// The last word when the body is not a multiple of 8 bytes, zero
+    /// padded. Kept out of line so [`Self::word`] stays a load and a branch
+    /// at every inlined site; the readers on the hot path are size sensitive.
+    #[cold]
+    #[inline(never)]
+    fn tail_word(rest: &[u8]) -> u64 {
+        let mut word = [0; 8];
+        word[..rest.len()].copy_from_slice(rest);
+        u64::from_le_bytes(word)
+    }
+
+    /// The first set bit at or after bit `i`, which a cursor stepping one
+    /// element at a time knows is set. Small enough to inline into `next()`,
+    /// unlike [`Self::next_set`] with its skip count.
+    #[inline]
+    pub(crate) fn successor(&self, i: u32) -> u32 {
+        let mut at = (i / 64) as usize;
+        let mut word = self.word(at) & (u64::MAX << (i % 64));
+        while word == 0 {
+            at += 1;
+            word = self.word(at);
+        }
+        at as u32 * 64 + word.trailing_zeros()
     }
 
     /// The first set bit at or after bit `i`, with the number of set bits in
