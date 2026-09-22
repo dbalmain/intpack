@@ -558,10 +558,23 @@ pub fn decode(n: usize, buf: &[u8], out: &mut Vec<u32>) {
 ///
 /// The scalar loop is the reference. SSE2 compares four lanes at a time;
 /// `_mm_cmpgt_epi32` is signed, so both sides are xored with `0x8000_0000`
-/// and the unsigned order falls out of the signed compare.
+/// and the unsigned order falls out of the signed compare. AVX-512 compares
+/// sixteen, unsigned, straight to a mask. A leapfrog's hop is a few ids and
+/// pays per compare-and-branch round, not per lane: at ∩ 1:10 the four-lane
+/// scan cost twice Lucene's scalar loop and the sixteen-lane one is level.
 #[inline]
 pub(crate) fn scan_geq(block: &[u32; BLOCK], start: usize, target: u32) -> Option<usize> {
-    #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+    // SAFETY: `scan_geq_avx512` requires AVX-512F, and this arm is compiled
+    // only where that feature is enabled.
+    unsafe {
+        scan_geq_avx512(block, start, target)
+    }
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "sse2",
+        not(target_feature = "avx512f")
+    ))]
     // SAFETY: `scan_geq_sse2` requires SSE2, and this arm is compiled only
     // where that feature is enabled.
     unsafe {
@@ -576,7 +589,37 @@ fn scan_geq_scalar(block: &[u32; BLOCK], start: usize, target: u32) -> Option<us
     (start..BLOCK).find(|&j| block[j] >= target)
 }
 
-#[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+#[target_feature(enable = "avx512f")]
+fn scan_geq_avx512(block: &[u32; BLOCK], start: usize, target: u32) -> Option<usize> {
+    use core::arch::x86_64::{_mm512_cmpge_epu32_mask, _mm512_loadu_si512, _mm512_set1_epi32};
+    // SAFETY: each load is a 64-byte group inside `block` (`i` stays on a
+    // 16-element boundary and stops at `BLOCK`).
+    unsafe {
+        let needle = _mm512_set1_epi32(target as i32);
+        let mut i = start & !15;
+        let mut skip = (start - i) as u32;
+        while i < BLOCK {
+            let hits =
+                (_mm512_cmpge_epu32_mask(_mm512_loadu_si512(block.as_ptr().add(i).cast()), needle)
+                    as u32
+                    >> skip)
+                    << skip;
+            if hits != 0 {
+                return Some(i + hits.trailing_zeros() as usize);
+            }
+            i += 16;
+            skip = 0;
+        }
+        None
+    }
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "sse2",
+    not(target_feature = "avx512f")
+))]
 #[target_feature(enable = "sse2")]
 fn scan_geq_sse2(block: &[u32; BLOCK], start: usize, target: u32) -> Option<usize> {
     use core::arch::x86_64::{
