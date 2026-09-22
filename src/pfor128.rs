@@ -87,7 +87,9 @@ fn bitset_bytes(first: u32, body_len: usize) -> usize {
 }
 
 /// Token, `first`, body length, then the body: bit `v - block[0]` set for
-/// each `v` in `block`.
+/// each `v` in `block`. Out of line: inlined into the block encoder it cost
+/// the packed path 9% of encode throughput on lists with no bitset at all.
+#[inline(never)]
 fn write_bitset(first: u32, body_len: usize, block: &[u32; BLOCK], out: &mut Vec<u8>) {
     out.push(BITSET_TOKEN);
     vbyte::put(first, out);
