@@ -52,11 +52,12 @@ fn block_bytes(rows: usize, width: u32) -> u64 {
 /// [`Column`]'s, and O(1).
 ///
 /// A nullable blocked column frames each block by its real values alone,
-/// and marks a block that holds a none with `NULLS`.
+/// and marks a block that holds a none with `NULLS`; those real values must
+/// span less than `u64::MAX` (see [`BlockedWriter::push_null`]).
 ///
 /// ```text
 /// table    per block: base u64, (offset << 8 | nulls | width) u64
-///                                                          (BLOCK_ENTRY)
+///          (BLOCK_ENTRY bytes; nulls is 0x80, width the low 7 bits)
 /// values   each block's values, packed LSB first from a byte boundary
 /// padding  PAD bytes
 /// ```
@@ -104,6 +105,9 @@ impl<'a> Blocked<'a> {
     /// every width is too, and the caller's record of both is exact. Only a
     /// `nullable` column may mark a block as holding a none.
     pub fn check(&self, max_width: u32, values: u64, nullable: bool) -> bool {
+        if max_width > MAX_WIDTH {
+            return false;
+        }
         let (mut end, mut widest) = (0, 0);
         for k in 0..self.table.len() / BLOCK_ENTRY as usize {
             let (_, offset, width) = self.entry(k);
@@ -116,14 +120,17 @@ impl<'a> Blocked<'a> {
         end == values && widest == max_width
     }
 
-    /// Value `i`. Panics past the column's end, as indexing a slice does.
+    /// Value `i`, below the column's count (a debug assertion); past the
+    /// table, it panics as indexing a slice does.
     pub fn get(&self, i: usize) -> u64 {
+        debug_assert!(i < self.count, "row {i} of {}", self.count);
         let (base, offset, width) = self.entry(i / BLOCK_ROWS);
         base.wrapping_add(Column::new(&self.values[offset..], width).get(i % BLOCK_ROWS))
     }
 
     /// Value `i` of a nullable column, or `None` where it holds none.
     pub fn nullable(&self, i: usize) -> Option<u64> {
+        debug_assert!(i < self.count, "row {i} of {}", self.count);
         let (base, packed) = self.words(i / BLOCK_ROWS);
         let (offset, width) = ((packed >> 8) as usize, (packed & 0x7F) as u32);
         let raw = Column::new(&self.values[offset..], width).get(i % BLOCK_ROWS);
@@ -150,6 +157,12 @@ impl<'a> Blocked<'a> {
     /// Values `first..first + out.len()` into `out`, a run of a pass over the
     /// column; `first` is a multiple of 8. See [`Column::decode`].
     pub fn decode(&self, first: usize, out: &mut [u64]) {
+        // An empty run may start anywhere, past the end included.
+        debug_assert!(
+            out.is_empty() || first + out.len() <= self.count,
+            "rows past {}",
+            self.count
+        );
         let mut done = 0;
         while done < out.len() {
             let row = first + done;
@@ -183,7 +196,10 @@ impl BlockSizer {
         self.next();
     }
 
-    /// A nullable column's none.
+    /// A nullable column's none. A block holding one must have real values
+    /// spanning less than `u64::MAX`, as [`BlockedWriter::push_null`] says;
+    /// a block that does not is sized at [`MAX_WIDTH`], and the writer
+    /// refuses it.
     pub fn push_null(&mut self) {
         self.nulls = true;
         self.next();
@@ -198,7 +214,7 @@ impl BlockSizer {
 
     fn close(&mut self) {
         if let Some((min, max)) = self.range.take() {
-            let w = block_width(min, max, self.nulls);
+            let w = block_width(min, max, self.nulls).unwrap_or(MAX_WIDTH);
             self.values += block_bytes(self.rows, w);
             self.width = self.width.max(w);
         }
@@ -214,9 +230,10 @@ impl BlockSizer {
 
 /// A block's width for real values from `min` to `max`: one more value's
 /// worth when the block holds a none, whose all-ones must be past them all.
-/// A nullable column's values must span less than `u64::MAX`.
-fn block_width(min: u64, max: u64, nulls: bool) -> u32 {
-    width(max - min + u64::from(nulls))
+/// `None` when that does not fit 64 bits: a block with a none whose values
+/// span all of `u64`.
+fn block_width(min: u64, max: u64, nulls: bool) -> Option<u32> {
+    (max - min).checked_add(u64::from(nulls)).map(width)
 }
 
 /// Streams a blocked column: holds one block of values, then writes its
@@ -252,7 +269,11 @@ impl BlockedWriter {
         self.next(table, values)
     }
 
-    /// A nullable column's none.
+    /// A nullable column's none. Its block's real values must span less
+    /// than `u64::MAX`, so that all ones above the smallest is past them all
+    /// (`Some(0)`, `Some(u64::MAX)` and a none cannot share a block): the
+    /// write that closes such a block fails with
+    /// [`io::ErrorKind::InvalidInput`], and the column is not usable.
     pub fn push_null(&mut self, table: &mut impl Write, values: &mut impl Write) -> io::Result<()> {
         self.nulls |= 1 << self.rows;
         self.next(table, values)
@@ -276,7 +297,15 @@ impl BlockedWriter {
         let real = || (0..block.len()).filter(|&i| !is_null(i)).map(|i| block[i]);
         // A block of nothing but nones has base 0 and width 0.
         let (min, w) = match (real().min(), real().max()) {
-            (Some(min), Some(max)) => (min, block_width(min, max, nulls != 0)),
+            (Some(min), Some(max)) => {
+                let w = block_width(min, max, nulls != 0).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "a nullable block's values span all of u64",
+                    )
+                })?;
+                (min, w)
+            }
             _ => (0, 0),
         };
         let flag = if nulls == 0 { 0 } else { NULLS };

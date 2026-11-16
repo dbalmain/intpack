@@ -382,3 +382,80 @@ fn an_empty_array_is_width_zero_and_refuses_every_row() {
     assert!(std::panic::catch_unwind(|| one.get(1)).is_err());
     assert!(one.heap_bytes() >= len(1, 64) as usize);
 }
+
+/// The format is persisted by callers, so these bytes are frozen: a change
+/// to the bit order, the padding, `BLOCK_ROWS`, the table entry or the
+/// nulls flag fails here, not in someone's stored data.
+#[test]
+fn golden_bytes_pin_the_stable_format() {
+    let le = |v: u64| v.to_le_bytes();
+    // A plain column: 1 to 5 at width 3, LSB first, then the padding.
+    let mut expected = vec![0xD1, 0x58];
+    expected.extend_from_slice(&[0; PAD]);
+    assert_eq!(pack(3, &[1, 2, 3, 4, 5]), expected);
+    // A blocked column of 130 rows: a full block alternating 5 and 6 (base
+    // 5, width 1), then a short block of two 9s (base 9, width 0) whose
+    // values start 16 bytes in.
+    let values: Vec<u64> = (0..130)
+        .map(|i| if i < 128 { 5 + i % 2 } else { 9 })
+        .collect();
+    let mut expected = [le(5), le(1), le(9), le(16 << 8)].concat();
+    expected.extend_from_slice(&[0xAA; 16]);
+    expected.extend_from_slice(&[0; PAD]);
+    assert_eq!(pack_blocked(&values).0, expected);
+    // A nullable block: 7, none, 8 is base 7 at width 2 with the 0x80 flag;
+    // the none is all ones: raw 0, 3, 1.
+    let mut expected = [le(7), le(0x80 | 2)].concat();
+    expected.push(0b01_11_00);
+    expected.extend_from_slice(&[0; PAD]);
+    assert_eq!(pack_nullable(&[Some(7), None, Some(8)]).0, expected);
+}
+
+#[test]
+fn a_nullable_block_spanning_all_of_u64_is_refused_not_wrapped() {
+    // Regression: the none's width was `max - min + 1`, which wrapped to 0
+    // in release, so `check` passed and every row read back as none.
+    let write = |values: &[Option<u64>]| {
+        let (mut table, mut packed) = (Vec::new(), Vec::new());
+        let mut writer = BlockedWriter::default();
+        for &v in values {
+            let pushed = match v {
+                Some(v) => writer.push(&mut table, &mut packed, v),
+                None => writer.push_null(&mut table, &mut packed),
+            };
+            assert!(pushed.is_ok());
+        }
+        writer.finish(&mut table, &mut packed)
+    };
+    let refused = write(&[Some(0), Some(u64::MAX), None]);
+    assert_eq!(
+        refused.map_err(|e| e.kind()).err(),
+        Some(std::io::ErrorKind::InvalidInput)
+    );
+    // One less is the widest span a nullable block holds: width 64.
+    let widest = [Some(0), Some(u64::MAX - 1), None];
+    assert!(write(&widest).is_ok());
+    let (bytes, len, width) = pack_nullable(&widest);
+    assert_eq!(width, 64);
+    let column = Blocked::new(&bytes, 3);
+    assert!(column.check(width, len, true));
+    assert!(column.nullable_values().eq(widest));
+    // Without a none, the full span is an ordinary width-64 block.
+    let (bytes, len, width) = pack_blocked(&[0, u64::MAX]);
+    assert!(Blocked::new(&bytes, 2).check(width, len, false));
+}
+
+#[test]
+fn check_refuses_a_width_past_64() {
+    // A table width field holds up to 127; `check` is the whole trust gate,
+    // so it refuses a caller's claimed widest past `MAX_WIDTH` itself.
+    // One block of 8 rows at width 65 is 65 bytes, so the table agrees with
+    // itself and with the claimed values length: only the width is wrong.
+    let mut bytes = [0u64.to_le_bytes(), 65u64.to_le_bytes()].concat();
+    bytes.extend_from_slice(&[0; 65 + PAD]);
+    let column = Blocked::new(&bytes, 8);
+    assert!(!column.check(65, 65, false));
+    // The same table at width 64 is trusted.
+    bytes[8] = 64;
+    assert!(Blocked::new(&bytes, 8).check(64, 64, false));
+}

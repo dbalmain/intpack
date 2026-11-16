@@ -1,13 +1,14 @@
 //! Fixed-width columns: `count` values of `width` bits each (0 to 64), value
 //! `i` starting at bit `i * width` of a little-endian, LSB-first bit string —
-//! the bit order of [`bits`], so a column is exactly what a
-//! [`bits::Writer`] putting every value at one width
+//! the bit order of [`bits`](crate::bits), so a column is exactly what a
+//! [`bits::Writer`](crate::bits::Writer) putting every value at one width
 //! writes, plus padding. Where the codecs elsewhere in the crate decode a
 //! list from its start, a column is read **by row**, in O(1), in place.
 //!
 //! A read is one unaligned 8-byte load, a shift and a mask, plus one more
 //! byte when the value straddles the 8-byte window (`shift + width > 64`,
-//! which only widths 58 to 63 can: width 64 always has shift 0). Every column
+//! which only widths 59, 61, 62 and 63 can, since a value's shift is a
+//! multiple of `gcd(width, 8)`: width 64 always has shift 0). Every column
 //! ends in [`PAD`] bytes of padding, so the load never runs off the end: the
 //! writer writes zeros, readers never depend on their value, and [`len`] is
 //! the exact length, padding included, which a caller reading untrusted bytes
@@ -21,10 +22,13 @@
 //!
 //! Writers stream to any [`std::io::Write`], holding at most one word, so a
 //! column never needs to be held whole to be written.
+//!
+//! **The byte layout is a stable format**: callers persist it. Changing
+//! the bit order, the padding, [`BLOCK_ROWS`], [`BLOCK_ENTRY`] or the
+//! blocked table entry breaks data already written; the golden-bytes tests
+//! fail when it changes.
 
 use std::io::{self, Write};
-
-use crate::bits;
 
 mod blocked;
 pub use blocked::{
@@ -80,7 +84,9 @@ impl<'a> Column<'a> {
         self.width
     }
 
-    /// Value `i`. Panics past the column's end, as indexing a slice does.
+    /// Value `i`. A column holds no count: a row just past the last reads
+    /// the padding as 0, and a read past the bytes panics, as indexing a
+    /// slice does.
     #[inline]
     pub fn get(&self, i: usize) -> u64 {
         let bit = i * self.width as usize;
@@ -114,8 +120,8 @@ impl<'a> Column<'a> {
             *value = u64::from_le_bytes(word) >> (bit % 8) & self.mask;
         }
         if width > 57 {
-            // Only widths 58 to 63 can straddle the 8-byte window (64 has shift
-            // 0).
+            // Only widths 59, 61, 62 and 63 can straddle the 8-byte window
+            // (64 has shift 0); the test admits the few widths that cannot.
             for (j, value) in out.iter_mut().enumerate() {
                 let (bit, shift) = (j * width, (j * width % 8) as u32);
                 if shift as usize + width > 64 {
@@ -151,17 +157,31 @@ impl Writer {
     /// Appends `value`, which must fit the width; extra high bits are
     /// dropped (and fail a debug assertion).
     pub fn push(&mut self, out: &mut impl Write, value: u64) -> io::Result<()> {
+        match self.add(value) {
+            Some(word) => out.write_all(&word),
+            None => Ok(()),
+        }
+    }
+
+    /// Takes `value`, returning the word it completes, if any.
+    fn add(&mut self, value: u64) -> Option<[u8; 8]> {
         debug_assert!(value <= self.mask, "{value} does not fit {}", self.width);
         let value = value & self.mask;
         self.pending |= value << self.filled;
         self.filled += self.width;
-        if self.filled >= u64::BITS {
-            out.write_all(&self.pending.to_le_bytes())?;
-            self.filled -= u64::BITS;
-            // The bits that did not fit: none when the word was empty.
-            self.pending = value.checked_shr(self.width - self.filled).unwrap_or(0);
+        if self.filled < u64::BITS {
+            return None;
         }
-        Ok(())
+        let word = self.pending.to_le_bytes();
+        self.filled -= u64::BITS;
+        // The bits that did not fit: none when the word was empty.
+        self.pending = value.checked_shr(self.width - self.filled).unwrap_or(0);
+        Some(word)
+    }
+
+    /// The last partial word's bytes.
+    fn tail(&self) -> ([u8; 8], usize) {
+        (self.pending.to_le_bytes(), self.filled.div_ceil(8) as usize)
     }
 
     /// Writes the last partial word and the [`PAD`] bytes: a column.
@@ -173,10 +193,10 @@ impl Writer {
     /// Writes the last partial word, without padding: a bit string of
     /// exactly `ceil(count * width / 8)` bytes, for a run that something else
     /// follows (a block of a [`Blocked`] column) or one read through a reader
-    /// that needs no padding ([`bits::Reader`]).
+    /// that needs no padding ([`bits::Reader`](crate::bits::Reader)).
     pub fn finish_unpadded(self, out: &mut impl Write) -> io::Result<()> {
-        let tail = self.filled.div_ceil(8) as usize;
-        out.write_all(&self.pending.to_le_bytes()[..tail])
+        let (word, len) = self.tail();
+        out.write_all(&word[..len])
     }
 }
 
@@ -254,10 +274,14 @@ impl Array {
         let len = values.len();
         let width = width(values.clone().max().unwrap_or(0));
         let mut bytes = Vec::with_capacity((len * width as usize).div_ceil(8) + PAD);
-        let mut writer = bits::Writer::new(&mut bytes);
+        let mut writer = Writer::new(width);
         for value in values {
-            writer.put(value, width);
+            if let Some(word) = writer.add(value) {
+                bytes.extend_from_slice(&word);
+            }
         }
+        let (word, tail) = writer.tail();
+        bytes.extend_from_slice(&word[..tail]);
         bytes.extend_from_slice(&[0; PAD]);
         Self { width, len, bytes }
     }
