@@ -37,6 +37,7 @@
 //! | [`vbyte`] | LEB128 varint | ✓ | ✓ | scan | — |
 //! | [`streamvbyte`] | 2-bit control stream + data | ✓ | ✓ | — | — |
 //! | [`bitpack`] | 128-int block kernels (the primitive) | | | | |
+//! | [`column`](mod@column) | fixed-width `u64` rows, optionally a frame per block | | ✓ | — | ✓ |
 //! | [`pfor128`] | patched 128-blocks, or a bitset when denser (sorted); frame min if unsorted; vbyte tail | ✓ | ✓ | scan | — |
 //! | [`pfor128skip`] | pfor128 + skip table | ✓ | ✓ | ✓ | ✓ |
 //! | [`fastpfor`] | patched frame-of-reference over blocks | ✓ | ✓ | — | — |
@@ -45,6 +46,7 @@
 
 pub mod bitpack;
 pub mod bits;
+pub mod column;
 pub mod cursor;
 pub mod delta;
 pub mod elias_fano;
