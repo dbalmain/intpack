@@ -190,6 +190,7 @@ pub struct BlockSizer {
 }
 
 impl BlockSizer {
+    #[inline]
     pub fn push(&mut self, value: u64) {
         let (min, max) = self.range.unwrap_or((value, value));
         self.range = Some((min.min(value), max.max(value)));
@@ -200,11 +201,13 @@ impl BlockSizer {
     /// spanning less than `u64::MAX`, as [`BlockedWriter::push_null`] says;
     /// a block that does not is sized at [`MAX_WIDTH`], and the writer
     /// refuses it.
+    #[inline]
     pub fn push_null(&mut self) {
         self.nulls = true;
         self.next();
     }
 
+    #[inline]
     fn next(&mut self) {
         self.rows += 1;
         if self.rows == BLOCK_ROWS {
