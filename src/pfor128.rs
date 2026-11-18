@@ -615,15 +615,17 @@ fn walk_sorted(n: usize, buf: &[u8], exact: bool) -> Option<bool> {
     let mut pos = 0;
     // The value a gap of 0 would decode to: the previous value plus one, or 0
     // at the head of the list. It only grows, so checking it once at the end
-    // covers every value, and as a `u64` it cannot wrap.
+    // covers every value. One block adds under 2^40, but a list of 2^25 such
+    // blocks would reach 2^64, so it saturates rather than wrapping to a
+    // small, passing total.
     let mut next = 0u64;
     for _ in 0..n / BLOCK {
         let token = *buf.get(pos)?;
         pos += 1;
-        if token == RAW_TOKEN {
+        let gain = if token == RAW_TOKEN {
             let raw = take_bytes(buf, &mut pos, BLOCK * size_of::<u32>())?;
             let gaps = raw.as_chunks::<4>().0.iter();
-            next += gaps.map(|&g| u64::from(u32::from_le_bytes(g))).sum::<u64>() + BLOCK_U64;
+            gaps.map(|&g| u64::from(u32::from_le_bytes(g))).sum::<u64>() + BLOCK_U64
         } else if token == BITSET_TOKEN {
             let first = take_varint(buf, &mut pos)?;
             let len = usize::from(*buf.get(pos)?);
@@ -636,7 +638,7 @@ fn walk_sorted(n: usize, buf: &[u8], exact: bool) -> Option<bool> {
                 return None;
             }
             let highest = (len as u64 - 1) * 8 + u64::from(7 - top.leading_zeros());
-            next += u64::from(first) + highest + 1;
+            u64::from(first) + highest + 1
         } else {
             let block = Patched::take(token, buf, &mut pos)?;
             let gaps = if exact {
@@ -644,11 +646,12 @@ fn walk_sorted(n: usize, buf: &[u8], exact: bool) -> Option<bool> {
             } else {
                 block.max_value() * BLOCK_U64
             };
-            next += gaps + BLOCK_U64;
-        }
+            gaps + BLOCK_U64
+        };
+        next = next.saturating_add(gain);
     }
     for _ in 0..n % BLOCK {
-        next += u64::from(take_varint(buf, &mut pos)?) + 1;
+        next = next.saturating_add(u64::from(take_varint(buf, &mut pos)?) + 1);
     }
     (pos == buf.len()).then_some(next <= 1 << 32)
 }
