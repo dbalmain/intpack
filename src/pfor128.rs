@@ -562,6 +562,201 @@ pub fn decode(n: usize, buf: &[u8], out: &mut Vec<u32>) {
     decode_tail(buf, &mut byte, n % BLOCK, out);
 }
 
+// ── checking ──
+
+/// Whether [`decode_sorted`] of `n` values from `buf` will neither panic nor
+/// wrap, and consumes exactly `buf.len()` bytes.
+///
+/// Decode reads a prefix of `buf` and ignores what follows, so "exactly" is
+/// the stricter contract: a buffer with trailing bytes, or one checked
+/// against the wrong `n`, is rejected. `true` also means every value fits in
+/// `u32` and the list is strictly increasing. Decode does not promise that
+/// on malformed input: a raw or packed block whose gaps sum past `u32::MAX`
+/// wraps silently, and a bitset block or tail value that does so panics in
+/// a debug build and wraps in release.
+///
+/// The check is stricter than decode in places, rejecting forms the encoder
+/// never writes even where decode would survive them: exception pairs out of
+/// order or with a high part of 0 or one that does not fit above the width,
+/// a varint with bits past 32, and a bitset without bit 0 or whose last
+/// body byte is 0. Every buffer [`encode_sorted`] writes passes.
+///
+/// It walks block headers without unpacking. Only when an upper bound on
+/// the gaps (each packed lane at its width's maximum) could pass `u32::MAX`
+/// does it walk again, unpacking each packed block to sum its gaps exactly.
+pub fn check_sorted(n: usize, buf: &[u8]) -> bool {
+    match walk_sorted(n, buf, false) {
+        Some(fits) if fits => true,
+        Some(_) => walk_sorted(n, buf, true) == Some(true),
+        None => false,
+    }
+}
+
+/// Whether [`decode`] of `n` values from `buf` will not panic, does not wrap
+/// a value past `u32::MAX` adding its block's minimum, and consumes exactly
+/// `buf.len()` bytes; see [`check_sorted`] for why "exactly".
+///
+/// Decode adds a block's minimum to each value without a check: with no
+/// exceptions the SIMD path wraps silently, and with exceptions a debug
+/// build panics. The check unpacks a block only when the minimum plus the
+/// widest value its width and exceptions allow would pass `u32::MAX`.
+///
+/// Like [`check_sorted`] it also rejects forms the encoder never writes,
+/// and token `0xfe`, which unsorted lists never use.
+pub fn check(n: usize, buf: &[u8]) -> bool {
+    walk_unsorted(n, buf) == Some(buf.len())
+}
+
+/// Walk a sorted list's blocks and tail, `None` when the bytes are
+/// malformed. Otherwise whether every value fits `u32`: exactly when
+/// `exact`, else by an upper bound, so `false` may be a false alarm.
+fn walk_sorted(n: usize, buf: &[u8], exact: bool) -> Option<bool> {
+    const BLOCK_U64: u64 = BLOCK as u64;
+    let mut pos = 0;
+    // The value a gap of 0 would decode to: the previous value plus one, or 0
+    // at the head of the list. It only grows, so checking it once at the end
+    // covers every value, and as a `u64` it cannot wrap.
+    let mut next = 0u64;
+    for _ in 0..n / BLOCK {
+        let token = *buf.get(pos)?;
+        pos += 1;
+        if token == RAW_TOKEN {
+            let raw = take_bytes(buf, &mut pos, BLOCK * size_of::<u32>())?;
+            let gaps = raw.as_chunks::<4>().0.iter();
+            next += gaps.map(|&g| u64::from(u32::from_le_bytes(g))).sum::<u64>() + BLOCK_U64;
+        } else if token == BITSET_TOKEN {
+            let first = take_varint(buf, &mut pos)?;
+            let len = usize::from(*buf.get(pos)?);
+            pos += 1;
+            let body = take_bytes(buf, &mut pos, len)?;
+            // Decode writes one lane per set bit and needs exactly a block.
+            let ones: u32 = body.iter().map(|b| b.count_ones()).sum();
+            let (&head, &top) = (body.first()?, body.last()?);
+            if ones as usize != BLOCK || head & 1 == 0 || top == 0 {
+                return None;
+            }
+            let highest = (len as u64 - 1) * 8 + u64::from(7 - top.leading_zeros());
+            next += u64::from(first) + highest + 1;
+        } else {
+            let block = Patched::take(token, buf, &mut pos)?;
+            let gaps = if exact {
+                block.values().iter().map(|&g| u64::from(g)).sum()
+            } else {
+                block.max_value() * BLOCK_U64
+            };
+            next += gaps + BLOCK_U64;
+        }
+    }
+    for _ in 0..n % BLOCK {
+        next += u64::from(take_varint(buf, &mut pos)?) + 1;
+    }
+    (pos == buf.len()).then_some(next <= 1 << 32)
+}
+
+/// Walk an unsorted list's blocks and tail, returning the end of the bytes
+/// decode reads, or `None` if it would panic or wrap.
+fn walk_unsorted(n: usize, buf: &[u8]) -> Option<usize> {
+    let mut pos = 0;
+    for _ in 0..n / BLOCK {
+        let token = *buf.get(pos)?;
+        pos += 1;
+        if token == RAW_TOKEN {
+            take_bytes(buf, &mut pos, BLOCK * size_of::<u32>())?;
+            continue;
+        }
+        if token == BITSET_TOKEN {
+            return None;
+        }
+        let min = u64::from(take_varint(buf, &mut pos)?);
+        let block = Patched::take(token, buf, &mut pos)?;
+        let limit = u64::from(u32::MAX);
+        if min + block.max_value() > limit {
+            let max = block.values().into_iter().max().unwrap_or(0);
+            if min + u64::from(max) > limit {
+                return None;
+            }
+        }
+    }
+    for _ in 0..n % BLOCK {
+        take_varint(buf, &mut pos)?;
+    }
+    Some(pos)
+}
+
+/// `len` bytes at `*pos`, advancing past them; `None` past the end of `buf`.
+fn take_bytes<'a>(buf: &'a [u8], pos: &mut usize, len: usize) -> Option<&'a [u8]> {
+    let bytes = buf.get(*pos..pos.checked_add(len)?)?;
+    *pos += len;
+    Some(bytes)
+}
+
+/// [`vbyte::take`], `None` where it would read past `buf`, shift past 32
+/// bits (a debug panic), or drop high bits of a fifth byte.
+fn take_varint(buf: &[u8], pos: &mut usize) -> Option<u32> {
+    let mut v = 0;
+    for shift in (0..32).step_by(7) {
+        let b = *buf.get(*pos)?;
+        *pos += 1;
+        if shift == 28 && b > 0x0f {
+            return None;
+        }
+        v |= u32::from(b & 0x7f) << shift;
+        if b < 0x80 {
+            return Some(v);
+        }
+    }
+    None
+}
+
+/// A patched block's checked exception pairs and packed lows.
+struct Patched<'a> {
+    width: u32,
+    patches: &'a [u8],
+    packed: &'a [u8],
+}
+
+impl<'a> Patched<'a> {
+    /// The pairs and lows of the block with `token`, starting at `*pos` (past
+    /// the token and any minimum), advancing past them. `None` when a pair's
+    /// index is out of the block (decode panics), or the pairs are not in
+    /// ascending index order with a nonzero high part that fits above
+    /// `width`, as the encoder writes them.
+    fn take(token: u8, buf: &'a [u8], pos: &mut usize) -> Option<Self> {
+        let width = u32::from(token & 0x1f);
+        let patches = take_bytes(buf, pos, usize::from(token >> 5) * 2)?;
+        let mut prev = None;
+        for &[index, high] in patches.as_chunks::<2>().0 {
+            let fits = u64::from(high) << width <= u64::from(u32::MAX);
+            if usize::from(index) >= BLOCK || prev >= Some(index) || high == 0 || !fits {
+                return None;
+            }
+            prev = Some(index);
+        }
+        let packed = take_bytes(buf, pos, bitpack::packed_len(width))?;
+        Some(Self {
+            width,
+            patches,
+            packed,
+        })
+    }
+
+    /// The largest value the block could hold: a full low part under the
+    /// largest high part.
+    fn max_value(&self) -> u64 {
+        let high = self.patches.as_chunks::<2>().0.iter().map(|p| p[1]).max();
+        u64::from(low_mask(self.width)) | u64::from(high.unwrap_or(0)) << self.width
+    }
+
+    /// The block's values, before any minimum or delta: decode's own unpack
+    /// and patch.
+    fn values(&self) -> [u32; BLOCK] {
+        let mut out = [0; BLOCK];
+        bitpack::unpack(self.width, self.packed, &mut out);
+        apply_exceptions(self.width, self.patches, &mut out);
+        out
+    }
+}
+
 // ── cursor ──
 
 /// First index in `block[start..]` whose value is `>= target`.
@@ -857,6 +1052,22 @@ pub(crate) mod tests {
     use rand::prelude::*;
 
     use super::*;
+
+    /// [`super::encode_sorted`], asserting [`check_sorted`] accepts what it
+    /// wrote. It shadows the glob import, so every list a test in this module
+    /// encodes is also a check round trip.
+    fn encode_sorted(list: &[u32], out: &mut Vec<u8>) {
+        let start = out.len();
+        super::encode_sorted(list, out);
+        assert!(check_sorted(list.len(), &out[start..]), "{list:?}");
+    }
+
+    /// [`super::encode`], asserting [`check`] accepts what it wrote.
+    fn encode(list: &[u32], out: &mut Vec<u8>) {
+        let start = out.len();
+        super::encode(list, out);
+        assert!(check(list.len(), &out[start..]), "{list:?}");
+    }
 
     /// A strictly increasing list of `n` values with random gaps of up to
     /// `spread`.
@@ -1420,5 +1631,174 @@ pub(crate) mod tests {
             }
             assert_eq!(cursor.next(), None);
         }
+    }
+
+    /// Encoded lists of every block kind, sorted and not: runs, bitsets,
+    /// patched blocks with exceptions, plain packed, raw (unsorted), frames
+    /// near `u32::MAX`, and tails.
+    fn check_corpus() -> Vec<(bool, usize, Vec<u8>)> {
+        let mut outliers: Vec<u32> = (0..BLOCK as u32).map(|i| 1000 + i % 9).collect();
+        for i in [0, 5, 64, 127] {
+            outliers[i] = 300_000 + i as u32;
+        }
+        outliers.extend([3, 1 << 20]);
+        let mut high: Vec<u32> = (0..BLOCK as u32).map(|i| u32::MAX - 20 + i % 7).collect();
+        high[9] = u32::MAX - 5000;
+        let mut unsorted = unsorted_cases();
+        unsorted.extend([outliers, high]);
+        let mut corpus = Vec::new();
+        for list in sorted_cases() {
+            let mut buf = Vec::new();
+            super::encode_sorted(&list, &mut buf);
+            corpus.push((true, list.len(), buf));
+        }
+        for list in unsorted {
+            let mut buf = Vec::new();
+            super::encode(&list, &mut buf);
+            corpus.push((false, list.len(), buf));
+        }
+        corpus
+    }
+
+    /// Run the matching check on `buf`; when it accepts, decode must not
+    /// panic, must append `n` values, and a sorted list must be strictly
+    /// increasing (decode wraps silently on some malformed lists).
+    fn check_then_decode(sorted: bool, n: usize, buf: &[u8], what: &str) -> bool {
+        let ok = if sorted {
+            check_sorted(n, buf)
+        } else {
+            check(n, buf)
+        };
+        if ok {
+            let decoded = std::panic::catch_unwind(|| {
+                let mut out = Vec::new();
+                if sorted {
+                    decode_sorted(n, buf, &mut out);
+                } else {
+                    decode(n, buf, &mut out);
+                }
+                out
+            });
+            let out = decoded.unwrap_or_else(|_| panic!("{what}: check passed, decode panicked"));
+            assert_eq!(out.len(), n, "{what}");
+            if sorted {
+                assert!(out.is_sorted_by(|a, b| a < b), "{what}: wrapped");
+            }
+        }
+        ok
+    }
+
+    #[test]
+    fn check_passing_means_decode_does_not_panic() {
+        let (mut truncations, mut accepted, mut rejected) = (0, 0, 0);
+        for (case, (sorted, n, buf)) in check_corpus().into_iter().enumerate() {
+            assert!(check_then_decode(sorted, n, &buf, "intact"), "case {case}");
+            for len in 0..buf.len() {
+                let what = format!("case {case} cut to {len}");
+                assert!(!check_then_decode(sorted, n, &buf[..len], &what), "{what}");
+                truncations += 1;
+            }
+            assert!(
+                !check_then_decode(sorted, n, &[&buf[..], &[0]].concat(), "trailing byte"),
+                "case {case}"
+            );
+            let step = buf.len() / 300 + 1;
+            for at in (0..buf.len()).step_by(step) {
+                for flip in [0x01, 0x02, 0x10, 0x20, 0x80, 0xff] {
+                    let mut bad = buf.clone();
+                    bad[at] ^= flip;
+                    let what = format!("case {case} byte {at} ^ {flip:#x}");
+                    if check_then_decode(sorted, n, &bad, &what) {
+                        accepted += 1;
+                    } else {
+                        rejected += 1;
+                    }
+                }
+            }
+        }
+        println!("{truncations} truncations; mutations: {accepted} accepted, {rejected} rejected");
+        assert!(
+            accepted > 1000,
+            "{accepted} accepted: too few mutations reach decode"
+        );
+        assert!(
+            rejected > 1000,
+            "{rejected} rejected: the property may be vacuous"
+        );
+    }
+
+    /// A raw block of gaps `2^25`: 128 of them sum to `2^32`.
+    fn wrapping_raw_block() -> Vec<u8> {
+        let mut buf = vec![RAW_TOKEN];
+        for _ in 0..BLOCK {
+            buf.extend_from_slice(&(1u32 << 25).to_le_bytes());
+        }
+        buf
+    }
+
+    #[test]
+    fn sorted_decode_wraps_silently_and_check_rejects_it() {
+        let raw = wrapping_raw_block();
+        // Width 31 with every lane at its maximum.
+        let packed = [&[31][..], &[0xff; 31 * 16]].concat();
+        for buf in [raw, packed] {
+            let mut out = Vec::new();
+            decode_sorted(BLOCK, &buf, &mut out);
+            assert!(
+                !out.is_sorted_by(|a, b| a < b),
+                "decode wraps, it does not panic"
+            );
+            assert!(!check_sorted(BLOCK, &buf));
+        }
+        // The head counts its gap without the 1 the other 127 add, so a
+        // head 128 smaller ends exactly on u32::MAX.
+        let mut fits = wrapping_raw_block();
+        fits[1..5].copy_from_slice(&((1u32 << 25) - 128).to_le_bytes());
+        assert!(check_sorted(BLOCK, &fits));
+        let mut out = Vec::new();
+        decode_sorted(BLOCK, &fits, &mut out);
+        assert_eq!(out[BLOCK - 1], u32::MAX);
+    }
+
+    #[test]
+    fn unsorted_decode_wraps_silently_and_check_rejects_it() {
+        // Width 3, frame minimum u32::MAX - 2, every lane 7.
+        let mut buf = vec![3];
+        vbyte::put(u32::MAX - 2, &mut buf);
+        buf.extend_from_slice(&[0xff; 3 * 16]);
+        let mut out = Vec::new();
+        decode(BLOCK, &buf, &mut out);
+        assert_eq!(out[0], 4, "decode wraps, it does not panic");
+        assert!(!check(BLOCK, &buf));
+    }
+
+    #[test]
+    fn exact_pass_rescues_a_list_the_bound_rejects() {
+        // Gaps of 21 span too far for a bitset; the head near u32::MAX is
+        // one exception, so the bound puts every lane at 2^32 - 1.
+        let start = u32::MAX - 130 * 21;
+        let list: Vec<u32> = (0..131).map(|i| start + i * 21).collect();
+        let mut buf = Vec::new();
+        super::encode_sorted(&list, &mut buf);
+        assert_eq!(buf[0] >> 5, 1, "one exception");
+        assert_eq!(walk_sorted(list.len(), &buf, false), Some(false), "bound");
+        assert!(check_sorted(list.len(), &buf));
+    }
+
+    #[test]
+    fn checked_varint_reads_what_take_reads_and_stops_at_32_bits() {
+        for v in [0, 127, 128, 1 << 28, u32::MAX] {
+            let mut buf = Vec::new();
+            vbyte::put(v, &mut buf);
+            let (mut a, mut b) = (0, 0);
+            assert_eq!(take_varint(&buf, &mut a), Some(vbyte::take(&buf, &mut b)));
+            assert_eq!(a, b);
+        }
+        // A sixth byte would shift past 32 bits; a fifth above 0x0f drops bits.
+        assert_eq!(
+            take_varint(&[0x80, 0x80, 0x80, 0x80, 0x80, 0x01], &mut 0),
+            None
+        );
+        assert_eq!(take_varint(&[0x80, 0x80, 0x80, 0x80, 0x10], &mut 0), None);
     }
 }
